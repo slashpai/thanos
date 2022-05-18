@@ -27,7 +27,7 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 
-	v1 "github.com/thanos-io/thanos/pkg/api/query"
+	apiv1 "github.com/thanos-io/thanos/pkg/api/query"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/discovery/cache"
@@ -161,7 +161,7 @@ func registerQuery(app *extkingpin.App) {
 	enableMetricMetadataPartialResponse := cmd.Flag("metric-metadata.partial-response", "Enable partial response for metric metadata endpoint. --no-metric-metadata.partial-response for disabling.").
 		Hidden().Default("true").Bool()
 
-	featureList := cmd.Flag("enable-feature", "Comma separated experimental feature names to enable.The current list of features is "+promqlNegativeOffset+", "+promqlAtModifier+" and "+queryPushdown+".").Default("").Strings()
+	featureList := cmd.Flag("enable-feature", "Comma separated experimental feature names to enable.The current list of features is "+queryPushdown+".").Default("").Strings()
 
 	enableExemplarPartialResponse := cmd.Flag("exemplar.partial-response", "Enable partial response for exemplar endpoint. --no-exemplar.partial-response for disabling.").
 		Hidden().Default("true").Bool()
@@ -182,16 +182,16 @@ func registerQuery(app *extkingpin.App) {
 			return errors.Wrap(err, "parse federation labels")
 		}
 
-		var enableNegativeOffset, enableAtModifier, enableQueryPushdown bool
+		var enableQueryPushdown bool
 		for _, feature := range *featureList {
-			if feature == promqlNegativeOffset {
-				enableNegativeOffset = true
-			}
-			if feature == promqlAtModifier {
-				enableAtModifier = true
-			}
 			if feature == queryPushdown {
 				enableQueryPushdown = true
+			}
+			if feature == promqlAtModifier {
+				level.Warn(logger).Log("msg", "This option for --enable-feature is now permanently enabled and therefore a no-op.", "option", promqlAtModifier)
+			}
+			if feature == promqlNegativeOffset {
+				level.Warn(logger).Log("msg", "This option for --enable-feature is now permanently enabled and therefore a no-op.", "option", promqlNegativeOffset)
 			}
 		}
 
@@ -280,8 +280,6 @@ func registerQuery(app *extkingpin.App) {
 			*strictStores,
 			*strictEndpoints,
 			*webDisableCORS,
-			enableAtModifier,
-			enableNegativeOffset,
 			enableQueryPushdown,
 			*alertQueryURL,
 			component.Query,
@@ -349,8 +347,6 @@ func runQuery(
 	strictStores []string,
 	strictEndpoints []string,
 	disableCORS bool,
-	enableAtModifier bool,
-	enableNegativeOffset bool,
 	enableQueryPushdown bool,
 	alertQueryURL string,
 	comp component.Component,
@@ -480,8 +476,8 @@ func runQuery(
 			NoStepSubqueryIntervalFn: func(int64) int64 {
 				return defaultEvaluationInterval.Milliseconds()
 			},
-			EnableNegativeOffset: enableNegativeOffset,
-			EnableAtModifier:     enableAtModifier,
+			EnableNegativeOffset: true,
+			EnableAtModifier:     true,
 		}
 	)
 
@@ -578,6 +574,7 @@ func runQuery(
 		grpcProbe,
 		prober.NewInstrumentation(comp, logger, extprom.WrapRegistererWithPrefix("thanos_", reg)),
 	)
+	engineCreator := engineFactory(promql.NewEngine, engineOpts, dynamicLookbackDelta)
 
 	// Start query API + UI HTTP server.
 	{
@@ -604,10 +601,10 @@ func runQuery(
 		// TODO(bplotka in PR #513 review): pass all flags, not only the flags needed by prefix rewriting.
 		ui.NewQueryUI(logger, endpoints, webExternalPrefix, webPrefixHeaderName, alertQueryURL).Register(router, ins)
 
-		api := v1.NewQueryAPI(
+		api := apiv1.NewQueryAPI(
 			logger,
 			endpoints.GetEndpointStatus,
-			engineFactory(promql.NewEngine, engineOpts, dynamicLookbackDelta),
+			engineCreator,
 			queryableCreator,
 			// NOTE: Will share the same replica label as the query for now.
 			rules.NewGRPCClientWithDedup(rulesProxy, queryReplicaLabels),
@@ -665,19 +662,25 @@ func runQuery(
 			component.Query.String(),
 			info.WithLabelSetFunc(func() []labelpb.ZLabelSet { return proxy.LabelSet() }),
 			info.WithStoreInfoFunc(func() *infopb.StoreInfo {
-				minTime, maxTime := proxy.TimeRange()
-				return &infopb.StoreInfo{
-					MinTime: minTime,
-					MaxTime: maxTime,
+				if httpProbe.IsReady() {
+					mint, maxt := proxy.TimeRange()
+					return &infopb.StoreInfo{
+						MinTime: mint,
+						MaxTime: maxt,
+					}
 				}
+				return nil
 			}),
 			info.WithExemplarsInfoFunc(),
 			info.WithRulesInfoFunc(),
 			info.WithMetricMetadataInfoFunc(),
 			info.WithTargetsInfoFunc(),
+			info.WithQueryAPIInfoFunc(),
 		)
 
+		grpcAPI := apiv1.NewGRPCAPI(time.Now, queryableCreator, engineCreator, instantDefaultMaxSourceResolution)
 		s := grpcserver.New(logger, reg, tracer, grpcLogOpts, tagOpts, comp, grpcProbe,
+			grpcserver.WithServer(apiv1.RegisterQueryServer(grpcAPI)),
 			grpcserver.WithServer(store.RegisterStoreServer(proxy)),
 			grpcserver.WithServer(rules.RegisterRulesServer(rulesProxy)),
 			grpcserver.WithServer(targets.RegisterTargetsServer(targetsProxy)),
