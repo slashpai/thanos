@@ -6,6 +6,7 @@ package e2e_test
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -23,6 +24,9 @@ import (
 	config_util "github.com/prometheus/common/config"
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/prometheus/prometheus/storage/remote"
+	"github.com/thanos-io/thanos/pkg/api/query/querypb"
+	prompb_copy "github.com/thanos-io/thanos/pkg/store/storepb/prompb"
+	"google.golang.org/grpc"
 
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
@@ -50,59 +54,6 @@ import (
 	"github.com/thanos-io/thanos/test/e2e/e2ethanos"
 )
 
-// NOTE: by using aggregation all results are now unsorted.
-var queryUpWithoutInstance = func() string { return "sum(up) without (instance)" }
-
-// defaultPromConfig returns Prometheus config that sets Prometheus to:
-// * expose 2 external labels, source and replica.
-// * scrape fake target. This will produce up == 0 metric which we can assert on.
-// * optionally remote write endpoint to write into.
-func defaultPromConfig(name string, replica int, remoteWriteEndpoint, ruleFile string, scrapeTargets ...string) string {
-	targets := "localhost:9090"
-	if len(scrapeTargets) > 0 {
-		targets = strings.Join(scrapeTargets, ",")
-	}
-	config := fmt.Sprintf(`
-global:
-  external_labels:
-    prometheus: %v
-    replica: %v
-scrape_configs:
-- job_name: 'myself'
-  # Quick scrapes for test purposes.
-  scrape_interval: 1s
-  scrape_timeout: 1s
-  static_configs:
-  - targets: [%s]
-  relabel_configs:
-  - source_labels: ['__address__']
-    regex: '^.+:80$'
-    action: drop
-`, name, replica, targets)
-
-	if remoteWriteEndpoint != "" {
-		config = fmt.Sprintf(`
-%s
-remote_write:
-- url: "%s"
-  # Don't spam receiver on mistake.
-  queue_config:
-    min_backoff: 2s
-    max_backoff: 10s
-`, config, remoteWriteEndpoint)
-	}
-
-	if ruleFile != "" {
-		config = fmt.Sprintf(`
-%s
-rule_files:
--  "%s"
-`, config, ruleFile)
-	}
-
-	return config
-}
-
 func defaultWebConfig() string {
 	// username: test, secret: test(bcrypt hash)
 	return `
@@ -120,11 +71,11 @@ func sortResults(res model.Vector) {
 func TestSidecarNotReady(t *testing.T) {
 	t.Parallel()
 
-	e, err := e2e.NewDockerEnvironment("e2e_test_query")
+	e, err := e2e.NewDockerEnvironment("e2e_test_query_sidecar_not_ready")
 	testutil.Ok(t, err)
 	t.Cleanup(e2ethanos.CleanScenario(t, e))
 
-	prom, sidecar, err := e2ethanos.NewPrometheusWithSidecar(e, "alone", defaultPromConfig("prom-alone", 0, "", ""), "", e2ethanos.DefaultPrometheusImage(), "")
+	prom, sidecar, err := e2ethanos.NewPrometheusWithSidecar(e, "alone", e2ethanos.DefaultPromConfig("prom-alone", 0, "", "", e2ethanos.LocalPrometheusTarget), "", e2ethanos.DefaultPrometheusImage(), "")
 	testutil.Ok(t, err)
 	testutil.Ok(t, e2e.StartAndWaitReady(prom, sidecar))
 	testutil.Ok(t, prom.Stop())
@@ -163,18 +114,18 @@ func TestQuery(t *testing.T) {
 	testutil.Ok(t, err)
 	testutil.Ok(t, e2e.StartAndWaitReady(receiverRunnable))
 
-	prom1, sidecar1, err := e2ethanos.NewPrometheusWithSidecar(e, "alone", defaultPromConfig("prom-alone", 0, "", ""), "", e2ethanos.DefaultPrometheusImage(), "")
+	prom1, sidecar1, err := e2ethanos.NewPrometheusWithSidecar(e, "alone", e2ethanos.DefaultPromConfig("prom-alone", 0, "", "", e2ethanos.LocalPrometheusTarget), "", e2ethanos.DefaultPrometheusImage(), "")
 	testutil.Ok(t, err)
-	prom2, sidecar2, err := e2ethanos.NewPrometheusWithSidecar(e, "remote-and-sidecar", defaultPromConfig("prom-both-remote-write-and-sidecar", 1234, e2ethanos.RemoteWriteEndpoint(receiver.InternalEndpoint("remote-write")), ""), "", e2ethanos.DefaultPrometheusImage(), "")
+	prom2, sidecar2, err := e2ethanos.NewPrometheusWithSidecar(e, "remote-and-sidecar", e2ethanos.DefaultPromConfig("prom-both-remote-write-and-sidecar", 1234, e2ethanos.RemoteWriteEndpoint(receiver.Future().InternalEndpoint("remote-write")), "", e2ethanos.LocalPrometheusTarget), "", e2ethanos.DefaultPrometheusImage(), "")
 	testutil.Ok(t, err)
-	prom3, sidecar3, err := e2ethanos.NewPrometheusWithSidecar(e, "ha1", defaultPromConfig("prom-ha", 0, "", filepath.Join(e2ethanos.ContainerSharedDir, "", "*.yaml")), "", e2ethanos.DefaultPrometheusImage(), "")
+	prom3, sidecar3, err := e2ethanos.NewPrometheusWithSidecar(e, "ha1", e2ethanos.DefaultPromConfig("prom-ha", 0, "", filepath.Join(e2ethanos.ContainerSharedDir, "", "*.yaml"), e2ethanos.LocalPrometheusTarget), "", e2ethanos.DefaultPrometheusImage(), "")
 	testutil.Ok(t, err)
-	prom4, sidecar4, err := e2ethanos.NewPrometheusWithSidecar(e, "ha2", defaultPromConfig("prom-ha", 1, "", filepath.Join(e2ethanos.ContainerSharedDir, "", "*.yaml")), "", e2ethanos.DefaultPrometheusImage(), "")
+	prom4, sidecar4, err := e2ethanos.NewPrometheusWithSidecar(e, "ha2", e2ethanos.DefaultPromConfig("prom-ha", 1, "", filepath.Join(e2ethanos.ContainerSharedDir, "", "*.yaml"), e2ethanos.LocalPrometheusTarget), "", e2ethanos.DefaultPrometheusImage(), "")
 	testutil.Ok(t, err)
 	testutil.Ok(t, e2e.StartAndWaitReady(prom1, sidecar1, prom2, sidecar2, prom3, sidecar3, prom4, sidecar4))
 
 	// Querier. Both fileSD and directly by flags.
-	q, err := e2ethanos.NewQuerierBuilder(e, "1", sidecar1.InternalEndpoint("grpc"), sidecar2.InternalEndpoint("grpc"), receiver.InternalEndpoint("grpc")).
+	q, err := e2ethanos.NewQuerierBuilder(e, "1", sidecar1.InternalEndpoint("grpc"), sidecar2.InternalEndpoint("grpc"), receiver.Future().InternalEndpoint("grpc")).
 		WithFileSDStoreAddresses(sidecar3.InternalEndpoint("grpc"), sidecar4.InternalEndpoint("grpc")).Build()
 	testutil.Ok(t, err)
 	testutil.Ok(t, e2e.StartAndWaitReady(q))
@@ -184,7 +135,7 @@ func TestQuery(t *testing.T) {
 
 	testutil.Ok(t, q.WaitSumMetricsWithOptions(e2e.Equals(5), []string{"thanos_store_nodes_grpc_connections"}, e2e.WaitMissingMetrics()))
 
-	queryAndAssertSeries(t, ctx, q.Endpoint("http"), queryUpWithoutInstance, time.Now, promclient.QueryOptions{
+	queryAndAssertSeries(t, ctx, q.Endpoint("http"), e2ethanos.QueryUpWithoutInstance, time.Now, promclient.QueryOptions{
 		Deduplicate: false,
 	}, []model.Metric{
 		{
@@ -217,7 +168,7 @@ func TestQuery(t *testing.T) {
 	})
 
 	// With deduplication.
-	queryAndAssertSeries(t, ctx, q.Endpoint("http"), queryUpWithoutInstance, time.Now, promclient.QueryOptions{
+	queryAndAssertSeries(t, ctx, q.Endpoint("http"), e2ethanos.QueryUpWithoutInstance, time.Now, promclient.QueryOptions{
 		Deduplicate: true,
 	}, []model.Metric{
 		{
@@ -317,13 +268,13 @@ func TestQueryLabelNames(t *testing.T) {
 	testutil.Ok(t, err)
 	testutil.Ok(t, e2e.StartAndWaitReady(receiverRunnable))
 
-	prom1, sidecar1, err := e2ethanos.NewPrometheusWithSidecar(e, "alone", defaultPromConfig("prom-alone", 0, "", ""), "", e2ethanos.DefaultPrometheusImage(), "")
+	prom1, sidecar1, err := e2ethanos.NewPrometheusWithSidecar(e, "alone", e2ethanos.DefaultPromConfig("prom-alone", 0, "", "", e2ethanos.LocalPrometheusTarget), "", e2ethanos.DefaultPrometheusImage(), "")
 	testutil.Ok(t, err)
-	prom2, sidecar2, err := e2ethanos.NewPrometheusWithSidecar(e, "remote-and-sidecar", defaultPromConfig("prom-both-remote-write-and-sidecar", 1234, e2ethanos.RemoteWriteEndpoint(receiver.InternalEndpoint("remote-write")), ""), "", e2ethanos.DefaultPrometheusImage(), "")
+	prom2, sidecar2, err := e2ethanos.NewPrometheusWithSidecar(e, "remote-and-sidecar", e2ethanos.DefaultPromConfig("prom-both-remote-write-and-sidecar", 1234, e2ethanos.RemoteWriteEndpoint(receiver.Future().InternalEndpoint("remote-write")), "", e2ethanos.LocalPrometheusTarget), "", e2ethanos.DefaultPrometheusImage(), "")
 	testutil.Ok(t, err)
 	testutil.Ok(t, e2e.StartAndWaitReady(prom1, sidecar1, prom2, sidecar2))
 
-	q, err := e2ethanos.NewQuerierBuilder(e, "1", sidecar1.InternalEndpoint("grpc"), sidecar2.InternalEndpoint("grpc"), receiver.InternalEndpoint("grpc")).Build()
+	q, err := e2ethanos.NewQuerierBuilder(e, "1", sidecar1.InternalEndpoint("grpc"), sidecar2.InternalEndpoint("grpc"), receiver.Future().InternalEndpoint("grpc")).Build()
 	testutil.Ok(t, err)
 	testutil.Ok(t, e2e.StartAndWaitReady(q))
 
@@ -369,13 +320,13 @@ func TestQueryLabelValues(t *testing.T) {
 	testutil.Ok(t, err)
 	testutil.Ok(t, e2e.StartAndWaitReady(receiverRunnable))
 
-	prom1, sidecar1, err := e2ethanos.NewPrometheusWithSidecar(e, "alone", defaultPromConfig("prom-alone", 0, "", ""), "", e2ethanos.DefaultPrometheusImage(), "")
+	prom1, sidecar1, err := e2ethanos.NewPrometheusWithSidecar(e, "alone", e2ethanos.DefaultPromConfig("prom-alone", 0, "", "", e2ethanos.LocalPrometheusTarget), "", e2ethanos.DefaultPrometheusImage(), "")
 	testutil.Ok(t, err)
-	prom2, sidecar2, err := e2ethanos.NewPrometheusWithSidecar(e, "remote-and-sidecar", defaultPromConfig("prom-both-remote-write-and-sidecar", 1234, e2ethanos.RemoteWriteEndpoint(receiver.InternalEndpoint("remote-write")), ""), "", e2ethanos.DefaultPrometheusImage(), "")
+	prom2, sidecar2, err := e2ethanos.NewPrometheusWithSidecar(e, "remote-and-sidecar", e2ethanos.DefaultPromConfig("prom-both-remote-write-and-sidecar", 1234, e2ethanos.RemoteWriteEndpoint(receiver.Future().InternalEndpoint("remote-write")), ""), "", e2ethanos.DefaultPrometheusImage(), "")
 	testutil.Ok(t, err)
 	testutil.Ok(t, e2e.StartAndWaitReady(prom1, sidecar1, prom2, sidecar2))
 
-	q, err := e2ethanos.NewQuerierBuilder(e, "1", sidecar1.InternalEndpoint("grpc"), sidecar2.InternalEndpoint("grpc"), receiver.InternalEndpoint("grpc")).Build()
+	q, err := e2ethanos.NewQuerierBuilder(e, "1", sidecar1.InternalEndpoint("grpc"), sidecar2.InternalEndpoint("grpc"), receiver.Future().InternalEndpoint("grpc")).Build()
 	testutil.Ok(t, err)
 	testutil.Ok(t, e2e.StartAndWaitReady(q))
 
@@ -412,7 +363,7 @@ func TestQueryWithAuthorizedSidecar(t *testing.T) {
 	testutil.Ok(t, err)
 	t.Cleanup(e2ethanos.CleanScenario(t, e))
 
-	prom, sidecar, err := e2ethanos.NewPrometheusWithSidecar(e, "alone", defaultPromConfig("prom-alone", 0, "", ""), defaultWebConfig(), e2ethanos.DefaultPrometheusImage(), "")
+	prom, sidecar, err := e2ethanos.NewPrometheusWithSidecar(e, "alone", e2ethanos.DefaultPromConfig("prom-alone", 0, "", "", e2ethanos.LocalPrometheusTarget), defaultWebConfig(), e2ethanos.DefaultPrometheusImage(), "")
 	testutil.Ok(t, err)
 	testutil.Ok(t, e2e.StartAndWaitReady(prom, sidecar))
 
@@ -425,7 +376,7 @@ func TestQueryWithAuthorizedSidecar(t *testing.T) {
 
 	testutil.Ok(t, q.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"thanos_store_nodes_grpc_connections"}, e2e.WaitMissingMetrics()))
 
-	queryAndAssertSeries(t, ctx, q.Endpoint("http"), queryUpWithoutInstance, time.Now, promclient.QueryOptions{
+	queryAndAssertSeries(t, ctx, q.Endpoint("http"), e2ethanos.QueryUpWithoutInstance, time.Now, promclient.QueryOptions{
 		Deduplicate: false,
 	}, []model.Metric{
 		{
@@ -470,7 +421,7 @@ func TestQueryCompatibilityWithPreInfoAPI(t *testing.T) {
 			p1, s1, err := e2ethanos.NewPrometheusWithSidecarCustomImage(
 				e,
 				"p1",
-				defaultPromConfig("p1", 0, "", filepath.Join(e2ethanos.ContainerSharedDir, promRulesSubDir, "*.yaml"), "localhost:9090", qUninit.InternalEndpoint("http")),
+				e2ethanos.DefaultPromConfig("p1", 0, "", filepath.Join(e2ethanos.ContainerSharedDir, promRulesSubDir, "*.yaml"), e2ethanos.LocalPrometheusTarget, qUninit.Future().InternalEndpoint("http")),
 				"",
 				e2ethanos.DefaultPrometheusImage(),
 				"",
@@ -490,7 +441,7 @@ func TestQueryCompatibilityWithPreInfoAPI(t *testing.T) {
 config:
   sampler_type: const
   sampler_param: 1
-  service_name: %s`, qUninit.Name())). // Use fake tracing config to trigger exemplar.
+  service_name: %s`, qUninit.Future().Name())). // Use fake tracing config to trigger exemplar.
 				WithImage(tcase.queryImage).
 				Initiate(qUninit, s1.InternalEndpoint("grpc"))
 			testutil.Ok(t, err)
@@ -502,7 +453,7 @@ config:
 			// We should have single TCP connection, since all APIs are against the same server.
 			testutil.Ok(t, q.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"thanos_store_nodes_grpc_connections"}, e2e.WaitMissingMetrics()))
 
-			queryAndAssertSeries(t, ctx, q.Endpoint("http"), queryUpWithoutInstance, time.Now, promclient.QueryOptions{
+			queryAndAssertSeries(t, ctx, q.Endpoint("http"), e2ethanos.QueryUpWithoutInstance, time.Now, promclient.QueryOptions{
 				Deduplicate: false,
 			}, []model.Metric{
 				{
@@ -652,7 +603,7 @@ func TestSidecarStorePushdown(t *testing.T) {
 	testutil.Ok(t, err)
 	t.Cleanup(e2ethanos.CleanScenario(t, e))
 
-	prom1, sidecar1, err := e2ethanos.NewPrometheusWithSidecar(e, "p1", defaultPromConfig("p1", 0, "", ""), "", e2ethanos.DefaultPrometheusImage(), "", "remote-write-receiver")
+	prom1, sidecar1, err := e2ethanos.NewPrometheusWithSidecar(e, "p1", e2ethanos.DefaultPromConfig("p1", 0, "", ""), "", e2ethanos.DefaultPrometheusImage(), "", "remote-write-receiver")
 	testutil.Ok(t, err)
 	testutil.Ok(t, e2e.StartAndWaitReady(prom1, sidecar1))
 
@@ -701,8 +652,9 @@ func TestSidecarStorePushdown(t *testing.T) {
 
 	testutil.Ok(t, synthesizeSamples(ctx, prom1, []fakeMetricSample{
 		{
-			label: "foo",
-			value: 123,
+			label:             "foo",
+			value:             123,
+			timestampUnixNano: now.UnixNano(),
 		},
 	}))
 
@@ -869,11 +821,11 @@ func TestSidecarQueryEvaluation(t *testing.T) {
 			testutil.Ok(t, err)
 			t.Cleanup(e2ethanos.CleanScenario(t, e))
 
-			prom1, sidecar1, err := e2ethanos.NewPrometheusWithSidecar(e, "p1", defaultPromConfig("p1", 0, "", ""), "", e2ethanos.DefaultPrometheusImage(), "", "remote-write-receiver")
+			prom1, sidecar1, err := e2ethanos.NewPrometheusWithSidecar(e, "p1", e2ethanos.DefaultPromConfig("p1", 0, "", ""), "", e2ethanos.DefaultPrometheusImage(), "", "remote-write-receiver")
 			testutil.Ok(t, err)
 			testutil.Ok(t, e2e.StartAndWaitReady(prom1, sidecar1))
 
-			prom2, sidecar2, err := e2ethanos.NewPrometheusWithSidecar(e, "p2", defaultPromConfig("p2", 0, "", ""), "", e2ethanos.DefaultPrometheusImage(), "", "remote-write-receiver")
+			prom2, sidecar2, err := e2ethanos.NewPrometheusWithSidecar(e, "p2", e2ethanos.DefaultPromConfig("p2", 0, "", ""), "", e2ethanos.DefaultPrometheusImage(), "", "remote-write-receiver")
 			testutil.Ok(t, err)
 			testutil.Ok(t, e2e.StartAndWaitReady(prom2, sidecar2))
 
@@ -1088,7 +1040,7 @@ func queryExemplars(t *testing.T, ctx context.Context, addr, q string, start, en
 	}))
 }
 
-func synthesizeSamples(ctx context.Context, prometheus *e2e.InstrumentedRunnable, testSamples []fakeMetricSample) error {
+func synthesizeSamples(ctx context.Context, prometheus e2e.InstrumentedRunnable, testSamples []fakeMetricSample) error {
 	samples := make([]model.Sample, len(testSamples))
 	for i, s := range testSamples {
 		samples[i] = newSample(s)
@@ -1239,11 +1191,11 @@ func TestSidecarQueryEvaluationWithDedup(t *testing.T) {
 			testutil.Ok(t, err)
 			t.Cleanup(e2ethanos.CleanScenario(t, e))
 
-			prom1, sidecar1, err := e2ethanos.NewPrometheusWithSidecar(e, "p1", defaultPromConfig("p1", 0, "", ""), "", e2ethanos.DefaultPrometheusImage(), "", "remote-write-receiver")
+			prom1, sidecar1, err := e2ethanos.NewPrometheusWithSidecar(e, "p1", e2ethanos.DefaultPromConfig("p1", 0, "", ""), "", e2ethanos.DefaultPrometheusImage(), "", "remote-write-receiver")
 			testutil.Ok(t, err)
 			testutil.Ok(t, e2e.StartAndWaitReady(prom1, sidecar1))
 
-			prom2, sidecar2, err := e2ethanos.NewPrometheusWithSidecar(e, "p2", defaultPromConfig("p1", 1, "", ""), "", e2ethanos.DefaultPrometheusImage(), "", "remote-write-receiver")
+			prom2, sidecar2, err := e2ethanos.NewPrometheusWithSidecar(e, "p2", e2ethanos.DefaultPromConfig("p1", 1, "", ""), "", e2ethanos.DefaultPrometheusImage(), "", "remote-write-receiver")
 			testutil.Ok(t, err)
 			testutil.Ok(t, e2e.StartAndWaitReady(prom2, sidecar2))
 
@@ -1283,7 +1235,7 @@ func TestSidecarAlignmentPushdown(t *testing.T) {
 
 	now := time.Now()
 
-	prom1, sidecar1, err := e2ethanos.NewPrometheusWithSidecar(e, "p1", defaultPromConfig("p1", 0, "", ""), "", e2ethanos.DefaultPrometheusImage(), now.Add(time.Duration(-1)*time.Hour).Format(time.RFC3339), now.Format(time.RFC3339), "remote-write-receiver")
+	prom1, sidecar1, err := e2ethanos.NewPrometheusWithSidecar(e, "p1", e2ethanos.DefaultPromConfig("p1", 0, "", ""), "", e2ethanos.DefaultPrometheusImage(), now.Add(time.Duration(-1)*time.Hour).Format(time.RFC3339), now.Format(time.RFC3339), "remote-write-receiver")
 	testutil.Ok(t, err)
 	testutil.Ok(t, e2e.StartAndWaitReady(prom1, sidecar1))
 
@@ -1305,16 +1257,16 @@ func TestSidecarAlignmentPushdown(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
 	t.Cleanup(cancel)
 
+	samples := make([]fakeMetricSample, 0)
 	for i := now.Add(time.Duration(-3) * time.Hour); i.Before(now); i = i.Add(30 * time.Second) {
-		testutil.Ok(t, synthesizeSamples(ctx, prom1, []fakeMetricSample{
-			{
-				label:             "test",
-				value:             1,
-				timestampUnixNano: i.UnixNano(),
-			},
-		}))
-
+		samples = append(samples, fakeMetricSample{
+			label:             "test",
+			value:             1,
+			timestampUnixNano: i.UnixNano(),
+		})
 	}
+
+	testutil.Ok(t, synthesizeSamples(ctx, prom1, samples))
 
 	// This query should have identical requests.
 	testQuery := func() string { return `max_over_time({instance="test"}[5m])` }
@@ -1354,4 +1306,216 @@ func TestSidecarAlignmentPushdown(t *testing.T) {
 			}
 			return nil
 		})
+}
+
+func TestGrpcInstantQuery(t *testing.T) {
+	t.Parallel()
+
+	e, err := e2e.NewDockerEnvironment("e2e_test_query_grpc_api")
+	testutil.Ok(t, err)
+	t.Cleanup(e2ethanos.CleanScenario(t, e))
+
+	promConfig := e2ethanos.DefaultPromConfig("p1", 0, "", "")
+	prom, sidecar, err := e2ethanos.NewPrometheusWithSidecar(e, "p1", promConfig, "", e2ethanos.DefaultPrometheusImage(), "", "remote-write-receiver")
+	testutil.Ok(t, err)
+	testutil.Ok(t, e2e.StartAndWaitReady(prom, sidecar))
+
+	endpoints := []string{
+		sidecar.InternalEndpoint("grpc"),
+	}
+	querier, err := e2ethanos.
+		NewQuerierBuilder(e, "1", endpoints...).
+		Build()
+	testutil.Ok(t, err)
+	testutil.Ok(t, e2e.StartAndWaitReady(querier))
+
+	now := time.Now()
+	samples := []fakeMetricSample{
+		{
+			label:             "test",
+			value:             1,
+			timestampUnixNano: now.UnixNano(),
+		},
+		{
+			label:             "test",
+			value:             2,
+			timestampUnixNano: now.Add(time.Hour).UnixNano(),
+		},
+	}
+	ctx := context.Background()
+	testutil.Ok(t, synthesizeSamples(ctx, prom, samples))
+
+	grpcConn, err := grpc.Dial(querier.Endpoint("grpc"), grpc.WithInsecure())
+	testutil.Ok(t, err)
+	queryClient := querypb.NewQueryClient(grpcConn)
+
+	queries := []struct {
+		time           time.Time
+		expectedResult float64
+	}{
+		{
+			time:           now,
+			expectedResult: 1,
+		},
+		{
+			time:           now.Add(time.Hour),
+			expectedResult: 2,
+		},
+	}
+
+	for _, query := range queries {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
+		err = runutil.Retry(5*time.Second, ctx.Done(), func() error {
+			result, err := queryClient.Query(ctx, &querypb.QueryRequest{
+				Query:       "my_fake_metric",
+				TimeSeconds: query.time.Unix(),
+			})
+
+			if err != nil {
+				return err
+			}
+
+			var warnings string
+			var series []*prompb_copy.TimeSeries
+			for {
+				msg, err := result.Recv()
+				if err == io.EOF {
+					break
+				}
+
+				s := msg.GetTimeseries()
+				if s != nil {
+					series = append(series, s)
+				}
+				w := msg.GetWarnings()
+				if w != "" {
+					warnings = w
+				}
+			}
+
+			if warnings != "" {
+				return fmt.Errorf("got warnings, expected none")
+			}
+
+			if len(series) != 1 {
+				return fmt.Errorf("got empty result from querier")
+			}
+
+			if len(series[0].Samples) != 1 {
+				return fmt.Errorf("got empty timeseries from querier")
+			}
+
+			if series[0].Samples[0].Value != query.expectedResult {
+				return fmt.Errorf("got invalid result from querier")
+			}
+
+			return nil
+		})
+		testutil.Ok(t, err)
+		cancel()
+	}
+}
+
+func TestGrpcQueryRange(t *testing.T) {
+	t.Parallel()
+
+	e, err := e2e.NewDockerEnvironment("e2e_test_query_grpc_api")
+	testutil.Ok(t, err)
+	t.Cleanup(e2ethanos.CleanScenario(t, e))
+
+	promConfig := e2ethanos.DefaultPromConfig("p1", 0, "", "")
+	prom, sidecar, err := e2ethanos.NewPrometheusWithSidecar(e, "p1", promConfig, "", e2ethanos.DefaultPrometheusImage(), "", "remote-write-receiver")
+	testutil.Ok(t, err)
+	testutil.Ok(t, e2e.StartAndWaitReady(prom, sidecar))
+
+	endpoints := []string{
+		sidecar.InternalEndpoint("grpc"),
+	}
+	querier, err := e2ethanos.
+		NewQuerierBuilder(e, "1", endpoints...).
+		Build()
+	testutil.Ok(t, err)
+	testutil.Ok(t, e2e.StartAndWaitReady(querier))
+
+	now := time.Now()
+	samples := []fakeMetricSample{
+		{
+			label:             "test",
+			value:             1,
+			timestampUnixNano: now.UnixNano(),
+		},
+		{
+			label:             "test",
+			value:             2,
+			timestampUnixNano: now.Add(time.Second * 15).UnixNano(),
+		},
+		{
+			label:             "test",
+			value:             3,
+			timestampUnixNano: now.Add(time.Second * 30).UnixNano(),
+		},
+		{
+			label:             "test",
+			value:             4,
+			timestampUnixNano: now.Add(time.Second * 45).UnixNano(),
+		},
+		{
+			label:             "test",
+			value:             5,
+			timestampUnixNano: now.Add(time.Minute).UnixNano(),
+		},
+	}
+	ctx := context.Background()
+	testutil.Ok(t, synthesizeSamples(ctx, prom, samples))
+
+	grpcConn, err := grpc.Dial(querier.Endpoint("grpc"), grpc.WithInsecure())
+	testutil.Ok(t, err)
+	queryClient := querypb.NewQueryClient(grpcConn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
+	defer cancel()
+	err = runutil.Retry(5*time.Second, ctx.Done(), func() error {
+		result, err := queryClient.QueryRange(ctx, &querypb.QueryRangeRequest{
+			Query:            "my_fake_metric",
+			StartTimeSeconds: now.Unix(),
+			EndTimeSeconds:   now.Add(time.Minute).Unix(),
+			IntervalSeconds:  15,
+		})
+
+		if err != nil {
+			return err
+		}
+
+		var warnings string
+		var series []*prompb_copy.TimeSeries
+		for {
+			msg, err := result.Recv()
+			if err == io.EOF {
+				break
+			}
+
+			s := msg.GetTimeseries()
+			if s != nil {
+				series = append(series, s)
+			}
+			w := msg.GetWarnings()
+			if w != "" {
+				warnings = w
+			}
+		}
+		if warnings != "" {
+			return fmt.Errorf("got warnings, expected none")
+		}
+
+		if len(series) != 1 {
+			return fmt.Errorf("got empty result from querier")
+		}
+
+		if len(series[0].Samples) != 5 {
+			return fmt.Errorf("got empty timeseries from querier")
+		}
+
+		return nil
+	})
+	testutil.Ok(t, err)
 }

@@ -25,7 +25,7 @@ import (
 	"github.com/oklog/run"
 	"github.com/oklog/ulid"
 	"github.com/olekukonko/tablewriter"
-	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -129,6 +129,7 @@ type bucketReplicateConfig struct {
 }
 
 type bucketDownsampleConfig struct {
+	waitInterval          time.Duration
 	downsampleConcurrency int
 	dataDir               string
 	hashFunc              string
@@ -224,6 +225,8 @@ func (tbc *bucketRewriteConfig) registerBucketRewriteFlag(cmd extkingpin.FlagCla
 }
 
 func (tbc *bucketDownsampleConfig) registerBucketDownsampleFlag(cmd extkingpin.FlagClause) *bucketDownsampleConfig {
+	cmd.Flag("wait-interval", "Wait interval between downsample runs.").
+		Default("5m").DurationVar(&tbc.waitInterval)
 	cmd.Flag("downsample.concurrency", "Number of goroutines to use when downsampling blocks.").
 		Default("1").IntVar(&tbc.downsampleConcurrency)
 	cmd.Flag("data-dir", "Data directory in which to cache blocks and process downsamplings.").
@@ -330,7 +333,9 @@ func registerBucketVerify(app extkingpin.AppClause, objStoreConfig *extflag.Path
 			return err
 		}
 
-		fetcher, err := block.NewMetaFetcher(logger, block.FetcherConcurrency, bkt, "", extprom.WrapRegistererWithPrefix(extpromPrefix, reg), nil)
+		// We ignore any block that has the deletion marker file.
+		filters := []block.MetadataFilter{block.NewIgnoreDeletionMarkFilter(logger, bkt, 0, block.FetcherConcurrency)}
+		fetcher, err := block.NewMetaFetcher(logger, block.FetcherConcurrency, bkt, "", extprom.WrapRegistererWithPrefix(extpromPrefix, reg), filters)
 		if err != nil {
 			return err
 		}
@@ -579,8 +584,8 @@ func registerBucketWeb(app extkingpin.AppClause, objStoreConfig *extflag.PathOrC
 
 		ins := extpromhttp.NewInstrumentationMiddleware(reg, nil)
 
-		bucketUI := ui.NewBucketUI(logger, tbc.label, tbc.webExternalPrefix, tbc.webPrefixHeaderName, "", component.Bucket)
-		bucketUI.Register(router, true, ins)
+		bucketUI := ui.NewBucketUI(logger, tbc.webExternalPrefix, tbc.webPrefixHeaderName, component.Bucket)
+		bucketUI.Register(router, ins)
 
 		flagsMap := getFlagsMap(cmd.Flags())
 
@@ -638,7 +643,6 @@ func registerBucketWeb(app extkingpin.AppClause, objStoreConfig *extflag.PathOrC
 			return err
 		}
 		fetcher.UpdateOnChange(func(blocks []metadata.Meta, err error) {
-			bucketUI.Set(blocks, err)
 			api.SetGlobal(blocks, err)
 		})
 
@@ -747,7 +751,8 @@ func registerBucketDownsample(app extkingpin.AppClause, objStoreConfig *extflag.
 	tbc.registerBucketDownsampleFlag(cmd)
 
 	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, _ bool) error {
-		return RunDownsample(g, logger, reg, *httpAddr, *httpTLSConfig, time.Duration(*httpGracePeriod), tbc.dataDir, tbc.downsampleConcurrency, objStoreConfig, component.Downsample, metadata.HashFunc(tbc.hashFunc))
+		return RunDownsample(g, logger, reg, *httpAddr, *httpTLSConfig, time.Duration(*httpGracePeriod), tbc.dataDir,
+			tbc.waitInterval, tbc.downsampleConcurrency, objStoreConfig, component.Downsample, metadata.HashFunc(tbc.hashFunc))
 	})
 }
 

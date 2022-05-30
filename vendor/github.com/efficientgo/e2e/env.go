@@ -5,6 +5,7 @@ package e2e
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -107,8 +108,15 @@ type FutureRunnable interface {
 	Init(opts StartOptions) Runnable
 }
 
+// RunnableBuilder represents options that can be build into runnable and if
+// you want Future or Initiated Runnable from it.
 type RunnableBuilder interface {
+	// WithPorts adds ports to runnable, allowing caller to
+	// use `InternalEndpoint` and `Endpoint` methods by referencing port by name.
 	WithPorts(map[string]int) RunnableBuilder
+	// WithConcreteType allows to use different type for registration in environment,
+	// so environment listeners listening to `OnRunnableChange` can have different
+	// concrete type (e.g InstrumentedRunnable).
 	WithConcreteType(r Runnable) RunnableBuilder
 
 	// Future returns future runnable
@@ -121,11 +129,8 @@ type identificable interface {
 	id() uintptr
 }
 
-// Runnable is the entity that environment returns to manage single instance.
-type Runnable interface {
+type runnable interface {
 	identificable
-
-	Linkable
 
 	// IsRunning returns if runnable was started.
 	IsRunning() bool
@@ -154,6 +159,13 @@ type Runnable interface {
 	//
 	// If your service is not running, this method returns incorrect `stopped` endpoint.
 	Endpoint(portName string) string
+}
+
+// Runnable is the entity that environment returns to manage single instance.
+type Runnable interface {
+	runnable
+
+	Linkable
 }
 
 func StartAndWaitReady(runnables ...Runnable) error {
@@ -207,19 +219,31 @@ type ReadinessProbe interface {
 	Ready(runnable Runnable) (err error)
 }
 
-// HTTPReadinessProbe checks readiness by making HTTP call and checking for expected HTTP status code.
+// HTTPReadinessProbe checks readiness by making HTTP or HTTPS call and checking for expected HTTP/HTTPS status code.
 type HTTPReadinessProbe struct {
 	portName                 string
 	path                     string
+	scheme                   string
 	expectedStatusRangeStart int
 	expectedStatusRangeEnd   int
 	expectedContent          []string
 }
 
 func NewHTTPReadinessProbe(portName string, path string, expectedStatusRangeStart, expectedStatusRangeEnd int, expectedContent ...string) *HTTPReadinessProbe {
+	return newHTTPReadinessProbe(portName, path, "HTTP",
+		expectedStatusRangeStart, expectedStatusRangeEnd, expectedContent...)
+}
+
+func NewHTTPSReadinessProbe(portName, path string, expectedStatusRangeStart, expectedStatusRangeEnd int, expectedContent ...string) *HTTPReadinessProbe {
+	return newHTTPReadinessProbe(portName, path, "HTTPS",
+		expectedStatusRangeStart, expectedStatusRangeEnd, expectedContent...)
+}
+
+func newHTTPReadinessProbe(portName, path, scheme string, expectedStatusRangeStart, expectedStatusRangeEnd int, expectedContent ...string) *HTTPReadinessProbe {
 	return &HTTPReadinessProbe{
 		portName:                 portName,
 		path:                     path,
+		scheme:                   scheme,
 		expectedStatusRangeStart: expectedStatusRangeStart,
 		expectedStatusRangeEnd:   expectedStatusRangeEnd,
 		expectedContent:          expectedContent,
@@ -235,7 +259,16 @@ func (p *HTTPReadinessProbe) Ready(runnable Runnable) (err error) {
 		return errors.New("service has stopped")
 	}
 
-	res, err := (&http.Client{Timeout: 1 * time.Second}).Get("http://" + endpoint + p.path)
+	httpClient := &http.Client{Timeout: 1 * time.Second}
+	if p.scheme == "HTTPS" {
+		httpClient.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		}
+	}
+
+	res, err := httpClient.Get(p.scheme + "://" + endpoint + p.path)
 	if err != nil {
 		return err
 	}

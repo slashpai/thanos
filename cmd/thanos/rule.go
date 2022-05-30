@@ -30,6 +30,7 @@ import (
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
+	"github.com/prometheus/prometheus/notifier"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/rules"
 	"github.com/prometheus/prometheus/storage"
@@ -362,7 +363,9 @@ func runRule(
 			return 0, nil
 		}, conf.dataDir, 1*time.Minute, nil)
 		if err := remoteStore.ApplyConfig(&config.Config{
-			GlobalConfig:       config.DefaultGlobalConfig,
+			GlobalConfig: config.GlobalConfig{
+				ExternalLabels: labelsTSDBToProm(conf.lset),
+			},
 			RemoteWriteConfigs: rwCfg.RemoteWriteConfigs,
 		}); err != nil {
 			return errors.Wrap(err, "applying config to remote storage")
@@ -463,13 +466,13 @@ func runRule(
 	{
 		// Run rule evaluation and alert notifications.
 		notifyFunc := func(ctx context.Context, expr string, alerts ...*rules.Alert) {
-			res := make([]*alert.Alert, 0, len(alerts))
+			res := make([]*notifier.Alert, 0, len(alerts))
 			for _, alrt := range alerts {
 				// Only send actually firing alerts.
 				if alrt.State == rules.StatePending {
 					continue
 				}
-				a := &alert.Alert{
+				a := &notifier.Alert{
 					StartsAt:     alrt.FiredAt,
 					Labels:       alrt.Labels,
 					Annotations:  alrt.Annotations,
@@ -601,11 +604,14 @@ func runRule(
 				return tsdbStore.LabelSet()
 			}),
 			info.WithStoreInfoFunc(func() *infopb.StoreInfo {
-				mint, maxt := tsdbStore.TimeRange()
-				return &infopb.StoreInfo{
-					MinTime: mint,
-					MaxTime: maxt,
+				if httpProbe.IsReady() {
+					mint, maxt := tsdbStore.TimeRange()
+					return &infopb.StoreInfo{
+						MinTime: mint,
+						MaxTime: maxt,
+					}
 				}
+				return nil
 			}),
 		)
 		options = append(options, grpcserver.WithServer(store.RegisterStoreServer(tsdbStore)))
