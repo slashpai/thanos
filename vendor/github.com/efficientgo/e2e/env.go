@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -53,7 +54,7 @@ type Environment interface {
 	Runnable(name string) RunnableBuilder
 	// AddListener registers given listener to be notified on environment runnable changes.
 	AddListener(listener EnvironmentListener)
-	// AddCloser registers function to be invoked on close.
+	// AddCloser registers function to be invoked on close, before all containers are sent kill signal.
 	AddCloser(func())
 	// Close shutdowns isolated environment and cleans its resources.
 	Close()
@@ -71,12 +72,11 @@ type StartOptions struct {
 	Command   Command
 	Readiness ReadinessProbe
 	// WaitReadyBackofff represents backoff used for WaitReady.
-	WaitReadyBackoff    *backoff.Config
-	WaitDownloadBackoff *backoff.Config
-	Volumes             []string
-	UserNs              string
-	Privileged          bool
-	Capabilities        []RunnableCapabilities
+	WaitReadyBackoff *backoff.Config
+	Volumes          []string
+	UserNs           string
+	Privileged       bool
+	Capabilities     []RunnableCapabilities
 }
 
 type RunnableCapabilities string
@@ -150,15 +150,39 @@ type runnable interface {
 	// It should be ok to Stop and Kill more than once, with next invokes being noop.
 	Stop() error
 
-	// Exec runs the provided command inside the same process context (e.g in the docker container).
-	// It returns the stdout, stderr, and error response from attempting to run the command.
-	Exec(command Command) (string, string, error)
+	// Exec runs the provided command inside the same process context (e.g. in the running docker container).
+	// It returns error response from attempting to run the command.
+	// See ExecOptions for more options like returning output or attaching to e2e logging.
+	Exec(Command, ...ExecOption) error
 
 	// Endpoint returns external runnable endpoint (host:port) for given port name.
 	// External means that it will be accessible only from host, but not from docker containers.
 	//
 	// If your service is not running, this method returns incorrect `stopped` endpoint.
 	Endpoint(portName string) string
+}
+
+type ExecOption func(o *ExecOptions)
+
+type ExecOptions struct {
+	Stdout io.Writer
+	Stderr io.Writer
+}
+
+// WithExecOptionStdout sets stdout writer to be used when exec is performed.
+// By default, it is streaming to the env logger.
+func WithExecOptionStdout(stdout io.Writer) ExecOption {
+	return func(o *ExecOptions) {
+		o.Stdout = stdout
+	}
+}
+
+// WithExecOptionStderr sets stderr writer to be used when exec is performed.
+// By default, it is streaming to the env logger.
+func WithExecOptionStderr(stderr io.Writer) ExecOption {
+	return func(o *ExecOptions) {
+		o.Stderr = stderr
+	}
 }
 
 // Runnable is the entity that environment returns to manage single instance.
@@ -213,6 +237,11 @@ func NewCommandWithoutEntrypoint(cmd string, args ...string) Command {
 		Args:               args,
 		EntrypointDisabled: true,
 	}
+}
+
+// NewCommandRunUntilStop is a command that allows to keep container running.
+func NewCommandRunUntilStop() Command {
+	return NewCommandWithoutEntrypoint("tail", "-f", "/dev/null")
 }
 
 type ReadinessProbe interface {
@@ -324,6 +353,5 @@ func NewCmdReadinessProbe(cmd Command) *CmdReadinessProbe {
 }
 
 func (p *CmdReadinessProbe) Ready(runnable Runnable) error {
-	_, _, err := runnable.Exec(p.cmd)
-	return err
+	return runnable.Exec(p.cmd)
 }
