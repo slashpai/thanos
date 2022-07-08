@@ -8,11 +8,34 @@ NOTE: As semantic versioning states all 0.y.z releases can contain breaking chan
 
 We use *breaking :warning:* to mark changes that are not backward compatible (relates only to v0.y.z releases.)
 
+## [v0.27.0](https://github.com/thanos-io/thanos/tree/release-0.27) - 2022.07.05
+
+### Fixed
+
+- [#5339](https://github.com/thanos-io/thanos/pull/5339) Receive: When running in routerOnly mode, an interupt (SIGINT) will now exit the process.
+- [#5357](https://github.com/thanos-io/thanos/pull/5357) Store: Fix groupcache handling by making sure slashes in the cache's key are not getting interpreted by the router anymore.
+- [#5427](https://github.com/thanos-io/thanos/pull/5427) Receive: Fix Ketama hashring replication consistency. With the Ketama hashring, replication is currently handled by choosing subsequent nodes in the list of endpoints. This can lead to existing nodes getting more series when the hashring is scaled. This change makes replication to choose subsequent nodes from the hashring which should not create new series in old nodes when the hashring is scaled. Ketama hashring can be used by setting `--receive.hashrings-algorithm=ketama`.
+
+### Added
+
+- [#5337](https://github.com/thanos-io/thanos/pull/5337) Thanos Object Store: Add the `prefix` option to buckets.
+- [#5409](https://github.com/thanos-io/thanos/pull/5409) S3: Add option to force DNS style lookup.
+- [#5352](https://github.com/thanos-io/thanos/pull/5352) Cache: Add cache metrics to groupcache: `thanos_cache_groupcache_bytes`, `thanos_cache_groupcache_evictions_total`, `thanos_cache_groupcache_items` and `thanos_cache_groupcache_max_bytes`.
+- [#5391](https://github.com/thanos-io/thanos/pull/5391) Receive: Add relabeling support with the flag `--receive.relabel-config-file` or alternatively `--receive.relabel-config`.
+- [#5408](https://github.com/thanos-io/thanos/pull/5408) Receive: Add support for consistent hashrings. The flag `--receive.hashrings-algorithm` uses default `hashmod` but can also be set to `ketama` to leverage consistent hashrings. More technical information can be found here: https://dgryski.medium.com/consistent-hashing-algorithmic-tradeoffs-ef6b8e2fcae8.
+- [#5402](https://github.com/thanos-io/thanos/pull/5402) Receive: Implement api/v1/status/tsdb.
+
+### Changed
+
+- [#5410](https://github.com/thanos-io/thanos/pull/5410) Query: Close() after using query. This should reduce bumps in memory allocations.
+- [#5417](https://github.com/thanos-io/thanos/pull/5417) Ruler: *Breaking if you have not set this value (`--eval-interval`) yourself and rely on that value. :warning:*. Change the default evaluation interval from 30s to 1 minute in order to be compliant with Prometheus alerting compliance specification: https://github.com/prometheus/compliance/blob/main/alert_generator/specification.md#executing-an-alerting-rule.
+
 ## [v0.26.0](https://github.com/thanos-io/thanos/tree/release-0.26) - 2022.05.05
 
 ### Fixed
 - [#5281](https://github.com/thanos-io/thanos/pull/5281) Blocks: Use correct separators for filesystem paths and object storage paths respectively.
 - [#5300](https://github.com/thanos-io/thanos/pull/5300) Query: Ignore cache on queries with deduplication off.
+- [#5324](https://github.com/thanos-io/thanos/pull/5324) Reloader: Force trigger reload when config rollbacked
 
 ### Added
 
@@ -57,6 +80,7 @@ The binaries published with this release are built with Go1.17.8 to avoid [CVE-2
 
 ### Added
 
+- [#5153](https://github.com/thanos-io/thanos/pull/5153) Receive: option to extract tenant from client certificate
 - [#5110](https://github.com/thanos-io/thanos/pull/5110) Block: Do not upload DebugMeta files to obj store.
 - [#4963](https://github.com/thanos-io/thanos/pull/4963) Compactor, Store, Tools: Loading block metadata now only filters out duplicates within a source (or compaction group if replica labels are configured), and does so in parallel over sources.
 - [#5089](https://github.com/thanos-io/thanos/pull/5089) S3: Create an empty map in the case SSE-KMS is used and no KMSEncryptionContext is passed.

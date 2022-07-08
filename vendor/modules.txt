@@ -272,13 +272,6 @@ github.com/chromedp/cdproto/webauthn
 github.com/chromedp/chromedp
 github.com/chromedp/chromedp/device
 github.com/chromedp/chromedp/kb
-# github.com/containerd/cgroups v1.0.3
-## explicit; go 1.16
-github.com/containerd/cgroups
-github.com/containerd/cgroups/stats/v1
-# github.com/coreos/go-systemd/v22 v22.3.2
-## explicit; go 1.12
-github.com/coreos/go-systemd/v22/dbus
 # github.com/cortexproject/cortex v1.10.1-0.20211124141505-4e9fc3a2b5ab => github.com/akanshat/cortex v1.10.1-0.20211222182735-328fbeedd424
 ## explicit; go 1.16
 github.com/cortexproject/cortex/pkg/chunk
@@ -330,16 +323,13 @@ github.com/dgryski/go-rendezvous
 # github.com/dimchansky/utfbom v1.1.1
 ## explicit
 github.com/dimchansky/utfbom
-# github.com/docker/go-units v0.4.0
-## explicit
-github.com/docker/go-units
 # github.com/dustin/go-humanize v1.0.0
 ## explicit
 github.com/dustin/go-humanize
 # github.com/edsrzf/mmap-go v1.1.0
 ## explicit; go 1.17
 github.com/edsrzf/mmap-go
-# github.com/efficientgo/e2e v0.11.2-0.20220224081107-b67f7b039363
+# github.com/efficientgo/e2e v0.12.1
 ## explicit; go 1.15
 github.com/efficientgo/e2e
 github.com/efficientgo/e2e/db
@@ -473,9 +463,6 @@ github.com/gobwas/pool/pbytes
 ## explicit
 github.com/gobwas/ws
 github.com/gobwas/ws/wsutil
-# github.com/godbus/dbus/v5 v5.0.6
-## explicit; go 1.12
-github.com/godbus/dbus/v5
 # github.com/gogo/googleapis v1.4.0
 ## explicit; go 1.12
 github.com/gogo/googleapis/google/rpc
@@ -679,9 +666,6 @@ github.com/oklog/ulid
 # github.com/olekukonko/tablewriter v0.0.2
 ## explicit; go 1.12
 github.com/olekukonko/tablewriter
-# github.com/opencontainers/runtime-spec v1.0.3-0.20210326190908-1c3f411f0417
-## explicit
-github.com/opencontainers/runtime-spec/specs-go
 # github.com/opentracing-contrib/go-grpc v0.0.0-20210225150812-73cb765af46e
 ## explicit; go 1.11
 github.com/opentracing-contrib/go-grpc
@@ -776,6 +760,7 @@ github.com/prometheus/prometheus/tsdb/tombstones
 github.com/prometheus/prometheus/tsdb/tsdbutil
 github.com/prometheus/prometheus/tsdb/wal
 github.com/prometheus/prometheus/util/gate
+github.com/prometheus/prometheus/util/httputil
 github.com/prometheus/prometheus/util/logging
 github.com/prometheus/prometheus/util/osutil
 github.com/prometheus/prometheus/util/pool
@@ -783,6 +768,7 @@ github.com/prometheus/prometheus/util/stats
 github.com/prometheus/prometheus/util/strutil
 github.com/prometheus/prometheus/util/teststorage
 github.com/prometheus/prometheus/util/testutil
+github.com/prometheus/prometheus/web/api/v1
 # github.com/rs/xid v1.2.1
 ## explicit
 github.com/rs/xid
