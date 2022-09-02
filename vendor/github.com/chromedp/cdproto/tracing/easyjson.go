@@ -29,7 +29,7 @@ func easyjsonC5a4559bDecodeGithubComChromedpCdprotoTracing(in *jlexer.Lexer, out
 	}
 	in.Delim('{')
 	for !in.IsDelim('}') {
-		key := in.UnsafeString()
+		key := in.UnsafeFieldName(false)
 		in.WantColon()
 		if in.IsNull() {
 			in.Skip()
@@ -39,6 +39,8 @@ func easyjsonC5a4559bDecodeGithubComChromedpCdprotoTracing(in *jlexer.Lexer, out
 		switch key {
 		case "recordMode":
 			(out.RecordMode).UnmarshalEasyJSON(in)
+		case "traceBufferSizeInKb":
+			out.TraceBufferSizeInKb = float64(in.Float64())
 		case "enableSampling":
 			out.EnableSampling = bool(in.Bool())
 		case "enableSystrace":
@@ -143,6 +145,16 @@ func easyjsonC5a4559bEncodeGithubComChromedpCdprotoTracing(out *jwriter.Writer, 
 		first = false
 		out.RawString(prefix[1:])
 		(in.RecordMode).MarshalEasyJSON(out)
+	}
+	if in.TraceBufferSizeInKb != 0 {
+		const prefix string = ",\"traceBufferSizeInKb\":"
+		if first {
+			first = false
+			out.RawString(prefix[1:])
+		} else {
+			out.RawString(prefix)
+		}
+		out.Float64(float64(in.TraceBufferSizeInKb))
 	}
 	if in.EnableSampling {
 		const prefix string = ",\"enableSampling\":"
@@ -278,7 +290,7 @@ func easyjsonC5a4559bDecodeGithubComChromedpCdprotoTracing1(in *jlexer.Lexer, ou
 	}
 	in.Delim('{')
 	for !in.IsDelim('}') {
-		key := in.UnsafeString()
+		key := in.UnsafeFieldName(false)
 		in.WantColon()
 		if in.IsNull() {
 			in.Skip()
@@ -304,6 +316,10 @@ func easyjsonC5a4559bDecodeGithubComChromedpCdprotoTracing1(in *jlexer.Lexer, ou
 				}
 				(*out.TraceConfig).UnmarshalEasyJSON(in)
 			}
+		case "perfettoConfig":
+			out.PerfettoConfig = string(in.String())
+		case "tracingBackend":
+			(out.TracingBackend).UnmarshalEasyJSON(in)
 		default:
 			in.SkipRecursive()
 		}
@@ -364,6 +380,26 @@ func easyjsonC5a4559bEncodeGithubComChromedpCdprotoTracing1(out *jwriter.Writer,
 		}
 		(*in.TraceConfig).MarshalEasyJSON(out)
 	}
+	if in.PerfettoConfig != "" {
+		const prefix string = ",\"perfettoConfig\":"
+		if first {
+			first = false
+			out.RawString(prefix[1:])
+		} else {
+			out.RawString(prefix)
+		}
+		out.String(string(in.PerfettoConfig))
+	}
+	if in.TracingBackend != "" {
+		const prefix string = ",\"tracingBackend\":"
+		if first {
+			first = false
+			out.RawString(prefix[1:])
+		} else {
+			out.RawString(prefix)
+		}
+		(in.TracingBackend).MarshalEasyJSON(out)
+	}
 	out.RawByte('}')
 }
 
@@ -401,7 +437,7 @@ func easyjsonC5a4559bDecodeGithubComChromedpCdprotoTracing2(in *jlexer.Lexer, ou
 	}
 	in.Delim('{')
 	for !in.IsDelim('}') {
-		key := in.UnsafeString()
+		key := in.UnsafeFieldName(false)
 		in.WantColon()
 		if in.IsNull() {
 			in.Skip()
@@ -480,7 +516,7 @@ func easyjsonC5a4559bDecodeGithubComChromedpCdprotoTracing3(in *jlexer.Lexer, ou
 	}
 	in.Delim('{')
 	for !in.IsDelim('}') {
-		key := in.UnsafeString()
+		key := in.UnsafeFieldName(false)
 		in.WantColon()
 		if in.IsNull() {
 			in.Skip()
@@ -490,6 +526,8 @@ func easyjsonC5a4559bDecodeGithubComChromedpCdprotoTracing3(in *jlexer.Lexer, ou
 		switch key {
 		case "deterministic":
 			out.Deterministic = bool(in.Bool())
+		case "levelOfDetail":
+			(out.LevelOfDetail).UnmarshalEasyJSON(in)
 		default:
 			in.SkipRecursive()
 		}
@@ -509,6 +547,16 @@ func easyjsonC5a4559bEncodeGithubComChromedpCdprotoTracing3(out *jwriter.Writer,
 		first = false
 		out.RawString(prefix[1:])
 		out.Bool(bool(in.Deterministic))
+	}
+	if in.LevelOfDetail != "" {
+		const prefix string = ",\"levelOfDetail\":"
+		if first {
+			first = false
+			out.RawString(prefix[1:])
+		} else {
+			out.RawString(prefix)
+		}
+		(in.LevelOfDetail).MarshalEasyJSON(out)
 	}
 	out.RawByte('}')
 }
@@ -547,7 +595,7 @@ func easyjsonC5a4559bDecodeGithubComChromedpCdprotoTracing4(in *jlexer.Lexer, ou
 	}
 	in.Delim('{')
 	for !in.IsDelim('}') {
-		key := in.UnsafeString()
+		key := in.UnsafeFieldName(false)
 		in.WantColon()
 		if in.IsNull() {
 			in.Skip()
@@ -613,7 +661,7 @@ func easyjsonC5a4559bDecodeGithubComChromedpCdprotoTracing5(in *jlexer.Lexer, ou
 	}
 	in.Delim('{')
 	for !in.IsDelim('}') {
-		key := in.UnsafeString()
+		key := in.UnsafeFieldName(false)
 		in.WantColon()
 		if in.IsNull() {
 			in.Skip()
@@ -672,7 +720,7 @@ func easyjsonC5a4559bDecodeGithubComChromedpCdprotoTracing6(in *jlexer.Lexer, ou
 	}
 	in.Delim('{')
 	for !in.IsDelim('}') {
-		key := in.UnsafeString()
+		key := in.UnsafeFieldName(false)
 		in.WantColon()
 		if in.IsNull() {
 			in.Skip()
@@ -769,7 +817,7 @@ func easyjsonC5a4559bDecodeGithubComChromedpCdprotoTracing7(in *jlexer.Lexer, ou
 	}
 	in.Delim('{')
 	for !in.IsDelim('}') {
-		key := in.UnsafeString()
+		key := in.UnsafeFieldName(false)
 		in.WantColon()
 		if in.IsNull() {
 			in.Skip()
@@ -828,7 +876,7 @@ func easyjsonC5a4559bDecodeGithubComChromedpCdprotoTracing8(in *jlexer.Lexer, ou
 	}
 	in.Delim('{')
 	for !in.IsDelim('}') {
-		key := in.UnsafeString()
+		key := in.UnsafeFieldName(false)
 		in.WantColon()
 		if in.IsNull() {
 			in.Skip()
@@ -915,7 +963,7 @@ func easyjsonC5a4559bDecodeGithubComChromedpCdprotoTracing9(in *jlexer.Lexer, ou
 	}
 	in.Delim('{')
 	for !in.IsDelim('}') {
-		key := in.UnsafeString()
+		key := in.UnsafeFieldName(false)
 		in.WantColon()
 		if in.IsNull() {
 			in.Skip()
@@ -1013,7 +1061,7 @@ func easyjsonC5a4559bDecodeGithubComChromedpCdprotoTracing10(in *jlexer.Lexer, o
 	}
 	in.Delim('{')
 	for !in.IsDelim('}') {
-		key := in.UnsafeString()
+		key := in.UnsafeFieldName(false)
 		in.WantColon()
 		if in.IsNull() {
 			in.Skip()
@@ -1104,7 +1152,7 @@ func easyjsonC5a4559bDecodeGithubComChromedpCdprotoTracing11(in *jlexer.Lexer, o
 	}
 	in.Delim('{')
 	for !in.IsDelim('}') {
-		key := in.UnsafeString()
+		key := in.UnsafeFieldName(false)
 		in.WantColon()
 		if in.IsNull() {
 			in.Skip()

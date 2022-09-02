@@ -19,12 +19,17 @@ func Struct(rt reflect.Type, gens map[string]gopter.Gen) gopter.Gen {
 	}
 	fieldGens := []gopter.Gen{}
 	fieldTypes := []reflect.Type{}
+	assignable := reflect.New(rt).Elem()
 	for i := 0; i < rt.NumField(); i++ {
 		fieldName := rt.Field(i).Name
+		if !assignable.Field(i).CanSet() {
+			continue
+		}
+
 		gen := gens[fieldName]
 		if gen != nil {
 			fieldGens = append(fieldGens, gen)
-			fieldTypes = append(fieldTypes, gen(gopter.MinGenParams).ResultType)
+			fieldTypes = append(fieldTypes, rt.Field(i).Type)
 		}
 	}
 
@@ -37,6 +42,9 @@ func Struct(rt reflect.Type, gens map[string]gopter.Gen) gopter.Gen {
 			if _, ok := gens[rt.Field(i).Name]; !ok {
 				continue
 			}
+			if !assignable.Field(i).CanSet() {
+				continue
+			}
 			result.Elem().Field(i).Set(args[0])
 			args = args[1:]
 		}
@@ -47,6 +55,9 @@ func Struct(rt reflect.Type, gens map[string]gopter.Gen) gopter.Gen {
 		results := []reflect.Value{}
 		for i := 0; i < s.NumField(); i++ {
 			if _, ok := gens[rt.Field(i).Name]; !ok {
+				continue
+			}
+			if !assignable.Field(i).CanSet() {
 				continue
 			}
 			results = append(results, s.Field(i))
@@ -71,15 +82,22 @@ func StructPtr(rt reflect.Type, gens map[string]gopter.Gen) gopter.Gen {
 	if rt.Kind() == reflect.Ptr {
 		rt = rt.Elem()
 	}
+
+	buildPtrType := reflect.FuncOf([]reflect.Type{rt}, []reflect.Type{reflect.PtrTo(rt)}, false)
+	unbuildPtrType := reflect.FuncOf([]reflect.Type{reflect.PtrTo(rt)}, []reflect.Type{rt}, false)
+
+	buildPtrFunc := reflect.MakeFunc(buildPtrType, func(args []reflect.Value) []reflect.Value {
+		sp := reflect.New(rt)
+		sp.Elem().Set(args[0])
+		return []reflect.Value{sp}
+	})
+	unbuildPtrFunc := reflect.MakeFunc(unbuildPtrType, func(args []reflect.Value) []reflect.Value {
+		return []reflect.Value{args[0].Elem()}
+	})
+
 	return gopter.DeriveGen(
-		func(s interface{}) interface{} {
-			sp := reflect.New(rt)
-			sp.Elem().Set(reflect.ValueOf(s))
-			return sp.Interface()
-		},
-		func(sp interface{}) interface{} {
-			return reflect.ValueOf(sp).Elem().Interface()
-		},
+		buildPtrFunc.Interface(),
+		unbuildPtrFunc.Interface(),
 		Struct(rt, gens),
 	)
 }
