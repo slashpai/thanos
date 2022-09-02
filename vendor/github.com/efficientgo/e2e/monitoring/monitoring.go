@@ -4,6 +4,7 @@
 package e2emonitoring
 
 import (
+	"io/ioutil"
 	"net"
 	"net/http"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/efficientgo/e2e/monitoring/promconfig"
 	sdconfig "github.com/efficientgo/e2e/monitoring/promconfig/discovery/config"
 	"github.com/efficientgo/e2e/monitoring/promconfig/discovery/targetgroup"
+	"github.com/efficientgo/tools/core/pkg/errcapture"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -116,8 +118,9 @@ func (l *listener) OnRunnableChange(started []e2e.Runnable) error {
 }
 
 type opt struct {
-	scrapeInterval time.Duration
-	customRegistry *prometheus.Registry
+	scrapeInterval  time.Duration
+	customRegistry  *prometheus.Registry
+	customPromImage string
 }
 
 // WithScrapeInterval changes how often metrics are scrape by Prometheus. 5s by default.
@@ -133,6 +136,13 @@ func WithScrapeInterval(interval time.Duration) func(*opt) {
 func WithCustomRegistry(reg *prometheus.Registry) func(*opt) {
 	return func(o *opt) {
 		o.customRegistry = reg
+	}
+}
+
+// WithPrometheusImage allows injecting custom Prometheus docker image to use as scraper and queryable.
+func WithPrometheusImage(image string) func(*opt) {
+	return func(o *opt) {
+		o.customPromImage = image
 	}
 }
 
@@ -175,7 +185,11 @@ func Start(env e2e.Environment, opts ...Option) (_ *Service, err error) {
 	go func() { _ = s.Serve(list) }()
 	env.AddCloser(func() { _ = s.Close() })
 
-	p := e2edb.NewPrometheus(env, "monitoring")
+	var dbOpts []e2edb.Option
+	if opt.customPromImage != "" {
+		dbOpts = append(dbOpts, e2edb.WithImage(opt.customPromImage))
+	}
+	p := e2edb.NewPrometheus(env, "monitoring", dbOpts...)
 
 	_, port, err := net.SplitHostPort(list.Addr().String())
 	if err != nil {
@@ -205,6 +219,30 @@ func (s *Service) OpenUserInterfaceInBrowser(paths ...string) error {
 	return e2einteractive.OpenInBrowser("http://" + s.p.Endpoint(e2edb.AccessPortName) + strings.Join(paths, "/"))
 }
 
+// InstantQuery evaluates instant PromQL queries against monitoring service.
+func (s *Service) InstantQuery(query string) (string, error) {
+	if !s.p.IsRunning() {
+		return "", errors.Errorf("%s is not running", s.p.Name())
+	}
+
+	res, err := (&http.Client{}).Get("http://" + s.p.Endpoint(e2edb.AccessPortName) + "/api/v1/query?query=" + query)
+	if err != nil {
+		return "", err
+	}
+
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return "", errors.Errorf("unexpected status code %d while fetching metrics", res.StatusCode)
+	}
+	defer errcapture.ExhaustClose(&err, res.Body, "metrics response")
+
+	body, err := ioutil.ReadAll(res.Body)
+	return string(body), err
+}
+
+func (s *Service) GetMonitoringRunnable() e2e.InstrumentedRunnable {
+	return s.p.InstrumentedRunnable
+}
+
 func newCadvisor(env e2e.Environment, name string, cgroupPrefixes ...string) e2e.InstrumentedRunnable {
 	return e2e.NewInstrumentedRunnable(env, name).WithPorts(map[string]int{"http": 8080}, "http").Init(e2e.StartOptions{
 		// See https://github.com/google/cadvisor/blob/master/docs/runtime_options.md.
@@ -213,7 +251,7 @@ func newCadvisor(env e2e.Environment, name string, cgroupPrefixes ...string) e2e
 			"--docker_only=true",
 			"--raw_cgroup_prefix_whitelist="+strings.Join(cgroupPrefixes, ","),
 		),
-		Image: "gcr.io/cadvisor/cadvisor:v0.39.3",
+		Image: "gcr.io/cadvisor/cadvisor:v0.44.0",
 		// See https://github.com/google/cadvisor/blob/master/docs/running.md.
 		Volumes: []string{
 			"/:/rootfs:ro",

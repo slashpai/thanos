@@ -7,7 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"path"
 	"testing"
@@ -16,7 +16,8 @@ import (
 	"github.com/efficientgo/e2e"
 	"github.com/prometheus/prometheus/model/labels"
 
-	"github.com/thanos-io/thanos/pkg/objstore/client"
+	"github.com/thanos-io/objstore/client"
+
 	"github.com/thanos-io/thanos/pkg/query"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"github.com/thanos-io/thanos/pkg/testutil"
@@ -135,7 +136,7 @@ func TestInfo(t *testing.T) {
 			return err
 		}
 
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		defer runutil.CloseWithErrCapture(&err, resp.Body, "response body close")
 
 		var res struct {

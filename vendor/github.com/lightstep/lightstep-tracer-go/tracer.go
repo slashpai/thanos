@@ -4,10 +4,15 @@ package lightstep
 import (
 	"context"
 	"fmt"
+	"math/rand"
+	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/lightstep/lightstep-tracer-go/constants"
+	"github.com/lightstep/lightstep-tracer-go/internal/metrics"
 	"github.com/opentracing/opentracing-go"
 )
 
@@ -42,13 +47,17 @@ type tracerImpl struct {
 	opts       Options
 
 	// report loop management
-	closeOnce               sync.Once
-	closeReportLoopChannel  chan struct{}
-	reportLoopClosedChannel chan struct{}
+	closeOnce                     sync.Once
+	closeReportLoopChannel        chan struct{}
+	closeSystemMetricsLoopChannel chan struct{}
+	reportLoopClosedChannel       chan struct{}
 
 	converter   *protoConverter
 	accessToken string
 	attributes  map[string]string
+
+	metricsReporter             *metrics.Reporter
+	metricsMeasurementFrequency time.Duration
 
 	//////////////////////////////////////////////////////////
 	// MUTABLE MUTABLE MUTABLE MUTABLE MUTABLE MUTABLE MUTABLE
@@ -116,10 +125,11 @@ func CreateTracer(opts Options) (Tracer, error) {
 	attributes[TracerPlatformVersionKey] = runtime.Version()
 	attributes[TracerVersionKey] = TracerVersionValue
 
+	tracerID := genSeededGUID()
 	now := time.Now()
 	impl := &tracerImpl{
 		opts:                    opts,
-		reporterID:              genSeededGUID(),
+		reporterID:              tracerID,
 		buffer:                  newSpansBuffer(opts.MaxBufferedSpans),
 		flushing:                newSpansBuffer(opts.MaxBufferedSpans),
 		closeReportLoopChannel:  make(chan struct{}),
@@ -127,6 +137,22 @@ func CreateTracer(opts Options) (Tracer, error) {
 		converter:               newProtoConverter(opts),
 		accessToken:             opts.AccessToken,
 		attributes:              attributes,
+		metricsReporter: metrics.NewReporter(
+			metrics.WithReporterTracerID(tracerID),
+			metrics.WithReporterAccessToken(opts.AccessToken),
+			metrics.WithReporterTimeout(opts.SystemMetrics.Timeout),
+			metrics.WithReporterAddress(opts.SystemMetrics.Endpoint.urlWithoutPath()),
+			metrics.WithReporterAttributes(map[string]string{
+				metrics.ReporterPlatformKey:        TracerPlatformValue,
+				metrics.ReporterPlatformVersionKey: runtime.Version(),
+				metrics.ReporterVersionKey:         TracerVersionValue,
+				constants.HostnameKey:              attributes[constants.HostnameKey],
+				constants.ServiceVersionKey:        attributes[constants.ServiceVersionKey],
+				constants.ComponentNameKey:         attributes[constants.ComponentNameKey],
+			}),
+			metrics.WithReporterMeasurementDuration(opts.SystemMetrics.MeasurementFrequency),
+		),
+		metricsMeasurementFrequency: opts.SystemMetrics.MeasurementFrequency,
 	}
 
 	impl.buffer.setCurrent(now)
@@ -156,6 +182,12 @@ func CreateTracer(opts Options) (Tracer, error) {
 	}
 	for builtin, propagator := range opts.Propagators {
 		impl.propagators[builtin] = propagator
+	}
+
+	// allow disabling of system metrics via environment variable:
+	// LS_METRICS_ENABLED=false
+	if !opts.SystemMetrics.Disabled && strings.ToLower(os.Getenv("LS_METRICS_ENABLED")) != "false" {
+		go impl.systemMetricsLoop()
 	}
 
 	return impl, nil
@@ -222,7 +254,12 @@ func (tracer *tracerImpl) reconnectClient(now time.Time) {
 func (tracer *tracerImpl) Close(ctx context.Context) {
 	tracer.closeOnce.Do(func() {
 		// notify report loop that we are closing
-		close(tracer.closeReportLoopChannel)
+		if tracer.closeReportLoopChannel != nil {
+			close(tracer.closeReportLoopChannel)
+		}
+		if tracer.closeSystemMetricsLoopChannel != nil {
+			close(tracer.closeSystemMetricsLoopChannel)
+		}
 		select {
 		case <-tracer.reportLoopClosedChannel:
 			tracer.Flush(ctx)
@@ -250,7 +287,7 @@ func (tracer *tracerImpl) RecordSpan(raw RawSpan) {
 	tracer.lock.Lock()
 
 	// Early-out for disabled runtimes
-	if tracer.disabled {
+	if tracer.disabled || raw.Context.Sampled == "false" {
 		tracer.lock.Unlock()
 		return
 	}
@@ -268,6 +305,8 @@ func (tracer *tracerImpl) Flush(ctx context.Context) {
 	tracer.flushingLock.Lock()
 	defer tracer.flushingLock.Unlock()
 
+	flushStart := time.Now()
+
 	if errorEvent := tracer.preFlush(); errorEvent != nil {
 		emitEvent(errorEvent)
 		return
@@ -281,8 +320,29 @@ func (tracer *tracerImpl) Flush(ctx context.Context) {
 		tracer.firstReportHasRun = true
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, tracer.opts.ReportTimeout)
-	defer cancel()
+	parts := 1
+	numOfRawSpans := len(tracer.flushing.rawSpans)
+	if numOfRawSpans > 0 {
+		var heuristicByteSize int
+		if numOfRawSpans == 1 {
+			heuristicByteSize = tracer.flushing.rawSpans[0].Len()
+		} else {
+			for i := 0; i < 2; i++ {
+				pivot := rand.New(rand.NewSource(time.Now().UnixNano())).Int() % numOfRawSpans
+				h := tracer.flushing.rawSpans[pivot].Len() * numOfRawSpans
+				if h > heuristicByteSize {
+					heuristicByteSize = h
+				}
+			}
+		}
+
+		if heuristicByteSize > tracer.opts.GRPCMaxCallSendMsgSizeBytes {
+			parts = heuristicByteSize / tracer.opts.GRPCMaxCallSendMsgSizeBytes
+			if heuristicByteSize%tracer.opts.GRPCMaxCallSendMsgSizeBytes != 0 {
+				parts += 1
+			}
+		}
+	}
 
 	protoReq := tracer.converter.toReportRequest(
 		tracer.reporterID,
@@ -295,34 +355,48 @@ func (tracer *tracerImpl) Flush(ctx context.Context) {
 		errorEvent := newEventFlushError(err, FlushErrorTranslate)
 		emitEvent(errorEvent)
 		// call postflush to prevent the tracer from going into an invalid state.
-		emitEvent(tracer.postFlush(errorEvent))
+		emitEvent(tracer.postFlush(flushStart, errorEvent))
 		return
 	}
 
+	reportRequests := req.SplitByParts(parts)
 	var reportErrorEvent *eventFlushError
-	resp, err := tracer.client.Report(ctx, req)
-	if err != nil {
-		reportErrorEvent = newEventFlushError(err, FlushErrorTransport)
-	} else if len(resp.GetErrors()) > 0 {
-		reportErrorEvent = newEventFlushError(fmt.Errorf(resp.GetErrors()[0]), FlushErrorReport)
+	for i := 0; i < len(reportRequests); i++ {
+		if err, reportErrorEvent = tracer.FlushSingle(ctx, reportRequests[i], flushStart); err != nil || reportErrorEvent != nil {
+			break
+		}
 	}
 
 	if reportErrorEvent != nil {
 		emitEvent(reportErrorEvent)
 	}
-	emitEvent(tracer.postFlush(reportErrorEvent))
+	emitEvent(tracer.postFlush(flushStart, reportErrorEvent))
+}
 
-	if err == nil && resp.DevMode() {
-		tracer.metaEventReportingEnabled = true
+func (tracer *tracerImpl) FlushSingle(ctx context.Context, req reportRequest, flushStart time.Time) (err error, reportErrorEvent *eventFlushError) {
+	ctx, cancel := context.WithTimeout(ctx, tracer.opts.ReportTimeout)
+	defer cancel()
+
+	resp, err := tracer.client.Report(ctx, req)
+	if err != nil {
+		reportErrorEvent = newEventFlushError(err, FlushErrorTransport)
+	} else if len(resp.GetErrors()) > 0 {
+		errEvent := fmt.Errorf(resp.GetErrors()[0])
+		reportErrorEvent = newEventFlushError(errEvent, FlushErrorReport)
 	}
 
-	if err == nil && !resp.DevMode() {
-		tracer.metaEventReportingEnabled = false
+	if err == nil {
+		if resp.DevMode() {
+			tracer.metaEventReportingEnabled = true
+		} else {
+			tracer.metaEventReportingEnabled = false
+		}
+		if resp.Disable() {
+			tracer.Disable()
+		}
 	}
 
-	if err == nil && resp.Disable() {
-		tracer.Disable()
-	}
+	return
 }
 
 // preFlush handles lock-protected data manipulation before flushing
@@ -348,24 +422,29 @@ func (tracer *tracerImpl) preFlush() *eventFlushError {
 }
 
 // postFlush handles lock-protected data manipulation after flushing
-func (tracer *tracerImpl) postFlush(flushEventError *eventFlushError) *eventStatusReport {
+func (tracer *tracerImpl) postFlush(flushStart time.Time, flushEventError *eventFlushError) *eventStatusReport {
+
 	tracer.lock.Lock()
 	defer tracer.lock.Unlock()
 
+	flushEnd := time.Now()
+
 	tracer.reportInFlight = false
 
-	statusReportEvent := newEventStatusReport(
-		tracer.flushing.reportStart,
-		tracer.flushing.reportEnd,
-		len(tracer.flushing.rawSpans),
-		int(tracer.flushing.droppedSpanCount+tracer.buffer.droppedSpanCount),
-		int(tracer.flushing.logEncoderErrorCount+tracer.buffer.logEncoderErrorCount),
-	)
-
 	if flushEventError == nil {
+		statusReportEvent := newEventStatusReport(
+			tracer.flushing.reportStart,
+			tracer.flushing.reportEnd,
+			len(tracer.flushing.rawSpans),
+			int(tracer.flushing.reportDroppedSpanCount()),
+			int(tracer.flushing.reportLogEncoderErrorCount()),
+			flushEnd.Sub(flushStart),
+		)
 		tracer.flushing.clear()
 		return statusReportEvent
 	}
+
+	reportStart, reportEnd := tracer.flushing.reportStart, tracer.flushing.reportEnd
 
 	switch flushEventError.State() {
 	case FlushErrorTranslate:
@@ -376,7 +455,14 @@ func (tracer *tracerImpl) postFlush(flushEventError *eventFlushError) *eventStat
 		tracer.buffer.mergeFrom(&tracer.flushing)
 	}
 
-	statusReportEvent.SetSentSpans(0)
+	statusReportEvent := newEventStatusReport(
+		reportStart,
+		reportEnd,
+		0,
+		int(tracer.buffer.reportDroppedSpanCount()),
+		int(tracer.buffer.reportLogEncoderErrorCount()),
+		flushEnd.Sub(flushStart),
+	)
 
 	return statusReportEvent
 }
@@ -441,6 +527,44 @@ func (tracer *tracerImpl) reportLoop() {
 			}
 		case <-tracer.closeReportLoopChannel:
 			close(tracer.reportLoopClosedChannel)
+			return
+		}
+	}
+}
+
+func (tracer *tracerImpl) systemMetricsLoop() {
+	ticker := time.NewTicker(tracer.metricsMeasurementFrequency)
+	intervals := int64(1)
+
+	measure := func(intervals int64) int64 {
+		ctx, cancel := context.WithTimeout(context.Background(), tracer.metricsMeasurementFrequency)
+		defer cancel()
+
+		if err := tracer.metricsReporter.Measure(ctx, intervals); err != nil {
+			emitEvent(newEventSystemMetricsMeasurementFailed(err))
+			intervals++
+		} else {
+			intervals = 1
+		}
+		emitEvent(newEventSystemMetricsStatusReport(
+			tracer.metricsReporter.Start,
+			tracer.metricsReporter.End,
+			tracer.metricsReporter.MetricsCount),
+		)
+		return intervals
+	}
+
+	intervals = measure(intervals)
+
+	for {
+		select {
+		case <-ticker.C:
+			if tracer.disabled {
+				return
+			}
+
+			intervals = measure(intervals)
+		case <-tracer.closeSystemMetricsLoopChannel:
 			return
 		}
 	}

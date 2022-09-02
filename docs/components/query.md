@@ -229,7 +229,7 @@ Additionally, Thanos supports dynamic prefix configuration, which [is not yet im
 
 ## File SD
 
-`--store.sd-file` flag provides a path to a JSON or YAML formatted file, which contains a list of targets in [Prometheus target format](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#file_sd_config).
+`--store.sd-files` flag provides a path to a JSON or YAML formatted file, which contains a list of targets in [Prometheus target format](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#file_sd_config).
 
 Example file SD file in YAML:
 
@@ -245,6 +245,10 @@ Example file SD file in YAML:
   - prometheus-1.thanos-sidecar.infra:10901
   - thanos-store.infra:10901
 ```
+
+## Active Query Tracking
+
+`--query.active-query-path` is an option which allows the user to specify a directory which will contain a `queries.active` file to track active queries. To enable this feature, the user has to specify a directory other than "", since that is skipped being the default.
 
 ## Flags
 
@@ -323,6 +327,9 @@ Flags:
                                  LogStartAndFinishCall: Logs the start and
                                  finish call of the requests. NoLogCall: Disable
                                  request logging.
+      --query.active-query-path=""
+                                 Directory to log currently active queries in
+                                 the queries.active file.
       --query.auto-downsampling  Enable automatic adjustment (step / 5) to what
                                  source of data should be used in store gateways
                                  if no max_source_resolution param is specified.

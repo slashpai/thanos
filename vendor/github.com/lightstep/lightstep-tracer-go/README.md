@@ -71,7 +71,7 @@ func shutdown(ctx context.Context) {
 ```
 
 ## Event Handling: Observing the LightStep tracer
-In order to connect diagnostic information from the lightstep tracer into an application's logging and metrics systems, inject an event handler using the `OnEvent` static method. Events may be typecast to check for errors or specific events such as status reports.
+In order to connect diagnostic information from the lightstep tracer into an application's logging and metrics systems, inject an event handler using the `SetGlobalEventHandler` static method. Events may be typecast to check for errors or specific events such as status reports.
 
 ```go
 import (
@@ -84,6 +84,8 @@ logAndMetricsHandler := func(event lightstep.Event){
   switch event := event.(type) {
   case EventStatusReport:
     metrics.Count("tracer.dropped_spans", event.DroppedSpans())
+  case MetricEventStatusReport:
+    metrics.Count("tracer.sent_metrics", event.SentMetrics())
   case ErrorEvent:
     logger.Error("LS Tracer error: %s", event)
   default:
@@ -115,3 +117,11 @@ There are two options for transport protocols:
 - [Protocol Buffers](https://developers.google.com/protocol-buffers/) over [GRPC](https://grpc.io/) - This is a more advanced solution that might be desirable if you already have gRPC networking configured.
 
 You can configure which transport protocol the tracer uses using the `UseGRPC` and `UseHttp` flags in the options.
+
+## Release
+
+To make a release, do these steps
+1. Run `make ver=X.Y.Z version`
+1. Update CHANGELOG.md
+1. Merge changes
+1. Run `make release_tag`

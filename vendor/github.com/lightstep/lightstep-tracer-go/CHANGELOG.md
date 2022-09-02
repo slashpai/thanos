@@ -1,6 +1,34 @@
 # Changelog
 
-## [Pending Release](https://github.com/lightstep/lightstep-tracer-go/compare/v0.18.1...HEAD)
+## [Pending Release](https://github.com/lightstep/lightstep-tracer-go/compare/v0.24.0...HEAD)
+
+## [v0.25.0](https://github.com/lightstep/lightstep-tracer-go/compare/v0.24.0...v0.25.0)
+* bump gogo/protobuf dependencies (#274)
+* Fix/span drops message larger than max (#277)
+* Upgrade gopsutil to gopsutil/v3 (#280)
+* propagate sampled (#279)
+
+## [v0.24.0](https://github.com/lightstep/lightstep-tracer-go/compare/v0.23.0...v0.24.0)
+* Fix issue where the `ot-tracer-sampled` header was propagated as an empty string if it was not explicitly set [#269]
+## [v0.23.0](https://github.com/lightstep/lightstep-tracer-go/compare/v0.22.0...v0.23.0)
+* Only emit spans dropped within a status interval in the status event report [#265](https://github.com/lightstep/lightstep-tracer-go/pull/265)
+* Generate uint64 trace IDs, instead of int64 [#267](https://github.com/lightstep/lightstep-tracer-go/pull/267)
+
+## [v0.22.0](https://github.com/lightstep/lightstep-tracer-go/compare/v0.21.0...v0.22.0)
+* Propagate the sampled flag, and use it to determine whether or not to report spans
+* Fix bug where trace IDs were not correctly truncated
+
+## [v0.21.0](https://github.com/lightstep/lightstep-tracer-go/compare/v0.20.0...v0.21.0)
+* Allow users to disable metrics via environment variable: `LS_METRICS_ENABLED=false`
+
+## [v0.20.0](https://github.com/lightstep/lightstep-tracer-go/compare/v0.19.0...v0.20.0)
+* Adding support for reporting metrics to Lightstep
+* Updating opencensus dependency
+
+## [v0.19.0](https://github.com/lightstep/lightstep-tracer-go/compare/v0.18.1...v0.19.0)
+* Add flush duration to status report struct.
+* Add option to set `MaxBufferedSpans`.
+* Add the option to add default tags.
 
 ## [v0.18.1](https://github.com/lightstep/lightstep-tracer-go/compare/v0.18.0...v0.18.1)
 * Adding support for configuring custom propagators

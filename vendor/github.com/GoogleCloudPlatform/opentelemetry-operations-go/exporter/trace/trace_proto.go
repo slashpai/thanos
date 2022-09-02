@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -33,6 +34,8 @@ import (
 	tracepb "google.golang.org/genproto/googleapis/devtools/cloudtrace/v2"
 	codepb "google.golang.org/genproto/googleapis/rpc/code"
 	statuspb "google.golang.org/genproto/googleapis/rpc/status"
+
+	"github.com/GoogleCloudPlatform/opentelemetry-operations-go/internal/resourcemapping"
 )
 
 const (
@@ -61,9 +64,26 @@ const (
 	// This is prefixed for google app engine, but translates to the service
 	// in the trace UI
 	labelService = `g.co/gae/app/module`
+
+	instrumentationScopeNameAttribute    = "otel.scope.name"
+	instrumentationScopeVersionAttribute = "otel.scope.version"
 )
 
 var userAgent = fmt.Sprintf("opentelemetry-go %s; google-cloud-trace-exporter %s", otel.Version(), Version())
+
+// Adapters for using resourcemapping library
+type attrs struct {
+	Attrs []attribute.KeyValue
+}
+
+func (a *attrs) GetString(key string) (string, bool) {
+	for _, kv := range a.Attrs {
+		if kv.Key == attribute.Key(key) {
+			return kv.Value.AsString(), true
+		}
+	}
+	return "", false
+}
 
 // If there are duplicate keys present in the list of attributes,
 // then the first value found for the key is preserved.
@@ -73,9 +93,11 @@ func attributeWithLabelsFromResources(sd sdktrace.ReadOnlySpan) []attribute.KeyV
 		return attributes
 	}
 	uniqueAttrs := make(map[attribute.Key]bool, len(sd.Attributes()))
+	// Span Attributes take precedence
 	for _, attr := range sd.Attributes() {
 		uniqueAttrs[attr.Key] = true
 	}
+	// Raw resource attributes are next.
 	for _, attr := range sd.Resource().Attributes() {
 		if uniqueAttrs[attr.Key] {
 			continue // skip resource attributes which conflict with span attributes
@@ -83,17 +105,45 @@ func attributeWithLabelsFromResources(sd sdktrace.ReadOnlySpan) []attribute.KeyV
 		uniqueAttrs[attr.Key] = true
 		attributes = append(attributes, attr)
 	}
+	// Instrumentation Scope attributes come next.
+	if !uniqueAttrs[instrumentationScopeNameAttribute] {
+		uniqueAttrs[instrumentationScopeNameAttribute] = true
+		scopeNameAttrs := attribute.String(instrumentationScopeNameAttribute, sd.InstrumentationLibrary().Name)
+		attributes = append(attributes, scopeNameAttrs)
+	}
+	if !uniqueAttrs[instrumentationScopeVersionAttribute] && strings.Compare("", sd.InstrumentationLibrary().Version) != 0 {
+		uniqueAttrs[instrumentationScopeVersionAttribute] = true
+		scopeVersionAttrs := attribute.String(instrumentationScopeVersionAttribute, sd.InstrumentationLibrary().Version)
+		attributes = append(attributes, scopeVersionAttrs)
+	}
 
+	// Monitored resource attributes (`g.co/r/{resource_type}/{resource_label}`) come next.
+	gceResource := resourcemapping.ResourceAttributesToMonitoredResource(&attrs{
+		Attrs: sd.Resource().Attributes(),
+	})
+	for key, value := range gceResource.Labels {
+		name := fmt.Sprintf("g.co/r/%v/%v", gceResource.Type, key)
+		attributes = append(attributes, attribute.String(name, value))
+	}
 	return attributes
 }
 
-func protoFromReadOnlySpan(s sdktrace.ReadOnlySpan, projectID string) *tracepb.Span {
+func (e *traceExporter) protoFromReadOnlySpan(s sdktrace.ReadOnlySpan) (*tracepb.Span, string) {
 	if s == nil {
-		return nil
+		return nil, ""
 	}
 
 	traceIDString := s.SpanContext().TraceID().String()
 	spanIDString := s.SpanContext().SpanID().String()
+	projectID := e.projectID
+	// override project ID with gcp.project.id, if present
+	attrs := s.Resource().Attributes()
+	for _, attr := range attrs {
+		if attr.Key == resourcemapping.ProjectIDAttributeKey {
+			projectID = attr.Value.AsString()
+			break
+		}
+	}
 
 	sp := &tracepb.Span{
 		Name:                    "projects/" + projectID + "/traces/" + traceIDString + "/spans/" + spanIDString,
@@ -118,20 +168,20 @@ func protoFromReadOnlySpan(s sdktrace.ReadOnlySpan, projectID string) *tracepb.S
 	}
 
 	attributes := attributeWithLabelsFromResources(s)
-	copyAttributes(&sp.Attributes, attributes)
+	e.copyAttributes(&sp.Attributes, attributes)
 	// NOTE(ymotongpoo): omitting copyMonitoringReesourceAttributes()
 
 	var annotations, droppedAnnotationsCount int
 	es := s.Events()
-	for i, e := range es {
+	for i, ev := range es {
 		if annotations >= maxAnnotationEventsPerSpan {
 			droppedAnnotationsCount = len(es) - i
 			break
 		}
-		annotation := &tracepb.Span_TimeEvent_Annotation{Description: trunc(e.Name, maxAttributeStringValue)}
-		copyAttributes(&annotation.Attributes, e.Attributes)
+		annotation := &tracepb.Span_TimeEvent_Annotation{Description: trunc(ev.Name, maxAttributeStringValue)}
+		e.copyAttributes(&annotation.Attributes, ev.Attributes)
 		event := &tracepb.Span_TimeEvent{
-			Time:  timestampProto(e.Time),
+			Time:  timestampProto(ev.Time),
 			Value: &tracepb.Span_TimeEvent_Annotation_{Annotation: annotation},
 		}
 		annotations++
@@ -171,15 +221,15 @@ func protoFromReadOnlySpan(s sdktrace.ReadOnlySpan, projectID string) *tracepb.S
 		sp.TimeEvents.DroppedAnnotationsCount = clip32(droppedAnnotationsCount)
 	}
 
-	sp.Links = linksProtoFromLinks(s.Links())
+	sp.Links = e.linksProtoFromLinks(s.Links())
 
-	return sp
+	return sp, projectID
 }
 
 // Converts OTel span links to Cloud Trace links proto in order. If there are
 // more than maxNumLinks links, the first maxNumLinks will be taken and the rest
 // dropped.
-func linksProtoFromLinks(links []sdktrace.Link) *tracepb.Span_Links {
+func (e *traceExporter) linksProtoFromLinks(links []sdktrace.Link) *tracepb.Span_Links {
 	numLinks := len(links)
 	if numLinks == 0 {
 		return nil
@@ -197,7 +247,7 @@ func linksProtoFromLinks(links []sdktrace.Link) *tracepb.Span_Links {
 			SpanId:  link.SpanContext.SpanID().String(),
 			Type:    tracepb.Span_Link_TYPE_UNSPECIFIED,
 		}
-		copyAttributes(&linkPb.Attributes, link.Attributes)
+		e.copyAttributes(&linkPb.Attributes, link.Attributes)
 		linksPb.Link = append(linksPb.Link, linkPb)
 	}
 	linksPb.DroppedLinksCount = clip32(numLinks - numLinksToKeep)
@@ -215,7 +265,7 @@ func timestampProto(t time.Time) *timestamppb.Timestamp {
 
 // copyAttributes copies a map of attributes to a proto map field.
 // It creates the map if it is nil.
-func copyAttributes(out **tracepb.Span_Attributes, in []attribute.KeyValue) {
+func (e *traceExporter) copyAttributes(out **tracepb.Span_Attributes, in []attribute.KeyValue) {
 	if len(in) == 0 {
 		return
 	}
@@ -231,28 +281,34 @@ func copyAttributes(out **tracepb.Span_Attributes, in []attribute.KeyValue) {
 		if av == nil {
 			continue
 		}
-		switch kv.Key {
-		case pathAttribute:
-			(*out).AttributeMap[labelHTTPPath] = av
-		case hostAttribute:
-			(*out).AttributeMap[labelHTTPHost] = av
-		case methodAttribute:
-			(*out).AttributeMap[labelHTTPMethod] = av
-		case userAgentAttribute:
-			(*out).AttributeMap[labelHTTPUserAgent] = av
-		case statusCodeAttribute:
-			(*out).AttributeMap[labelHTTPStatusCode] = av
-		case serviceAttribute:
-			(*out).AttributeMap[labelService] = av
-		default:
-			if len(kv.Key) > 128 {
-				dropped++
-				continue
-			}
-			(*out).AttributeMap[string(kv.Key)] = av
+		key := e.o.mapAttribute(kv.Key)
+		if len(key) > 128 {
+			dropped++
+			continue
 		}
+		(*out).AttributeMap[string(key)] = av
 	}
 	(*out).DroppedAttributesCount = dropped
+}
+
+// defaultAttributeMapping maps attributes to trace attributes which are
+// used by cloud trace for prominent UI functions, and keeps all others.
+func defaultAttributeMapping(k attribute.Key) attribute.Key {
+	switch k {
+	case pathAttribute:
+		return labelHTTPPath
+	case hostAttribute:
+		return labelHTTPHost
+	case methodAttribute:
+		return labelHTTPMethod
+	case userAgentAttribute:
+		return labelHTTPUserAgent
+	case statusCodeAttribute:
+		return labelHTTPStatusCode
+	case serviceAttribute:
+		return labelService
+	}
+	return k
 }
 
 func attributeValue(keyValue attribute.KeyValue) *tracepb.AttributeValue {

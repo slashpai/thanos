@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"io/ioutil"
 	"math/big"
 	"net"
 	"os"
@@ -27,13 +26,15 @@ import (
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/model/relabel"
+	"github.com/thanos-io/objstore/exthttp"
+	"github.com/thanos-io/objstore/providers/s3"
 	"gopkg.in/yaml.v2"
+
+	"github.com/thanos-io/objstore/client"
 
 	"github.com/thanos-io/thanos/pkg/alert"
 	"github.com/thanos-io/thanos/pkg/httpconfig"
-	"github.com/thanos-io/thanos/pkg/objstore"
-	"github.com/thanos-io/thanos/pkg/objstore/client"
-	"github.com/thanos-io/thanos/pkg/objstore/s3"
+
 	"github.com/thanos-io/thanos/pkg/queryfrontend"
 	"github.com/thanos-io/thanos/pkg/receive"
 )
@@ -100,12 +101,12 @@ func NewPrometheus(e e2e.Environment, name, promConfig, webConfig, promImage str
 		return e2e.NewErrInstrumentedRunnable(name, errors.Wrap(err, "create prometheus dir"))
 	}
 
-	if err := ioutil.WriteFile(filepath.Join(f.Dir(), "prometheus.yml"), []byte(promConfig), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(f.Dir(), "prometheus.yml"), []byte(promConfig), 0600); err != nil {
 		return e2e.NewErrInstrumentedRunnable(name, errors.Wrap(err, "creating prom config"))
 	}
 
 	if len(webConfig) > 0 {
-		if err := ioutil.WriteFile(filepath.Join(f.Dir(), "web-config.yml"), []byte(webConfig), 0600); err != nil {
+		if err := os.WriteFile(filepath.Join(f.Dir(), "web-config.yml"), []byte(webConfig), 0600); err != nil {
 			return e2e.NewErrInstrumentedRunnable(name, errors.Wrap(err, "creating web-config"))
 		}
 	}
@@ -166,6 +167,45 @@ func NewPrometheusWithSidecarCustomImage(e e2e.Environment, name, promConfig, we
 	return prom, sidecar
 }
 
+type AvalancheOptions struct {
+	MetricCount    string
+	SeriesCount    string
+	MetricInterval string
+	SeriesInterval string
+	ValueInterval  string
+
+	RemoteURL           string
+	RemoteWriteInterval string
+	RemoteBatchSize     string
+	RemoteRequestCount  string
+
+	TenantID string
+}
+
+func NewAvalanche(e e2e.Environment, name string, o AvalancheOptions) e2e.InstrumentedRunnable {
+	f := e2e.NewInstrumentedRunnable(e, name).WithPorts(map[string]int{"http": 9001}, "http").Future()
+
+	args := e2e.BuildArgs(map[string]string{
+		"--metric-count":          o.MetricCount,
+		"--series-count":          o.SeriesCount,
+		"--remote-url":            o.RemoteURL,
+		"--remote-write-interval": o.RemoteWriteInterval,
+		"--remote-batch-size":     o.RemoteBatchSize,
+		"--remote-requests-count": o.RemoteRequestCount,
+		"--value-interval":        o.ValueInterval,
+		"--metric-interval":       o.MetricInterval,
+		"--series-interval":       o.SeriesInterval,
+		"--remote-tenant-header":  "THANOS-TENANT",
+		"--remote-tenant":         o.TenantID,
+	})
+
+	// Using this particular image as https://github.com/prometheus-community/avalanche/pull/25 is not merged yet.
+	return f.Init(wrapWithDefaults(e2e.StartOptions{
+		Image:   "quay.io/observatorium/avalanche:make-tenant-header-configurable-2021-10-07-0a2cbf5",
+		Command: e2e.NewCommandWithoutEntrypoint("avalanche", args...),
+	}))
+}
+
 type QuerierBuilder struct {
 	name           string
 	routePrefix    string
@@ -181,6 +221,7 @@ type QuerierBuilder struct {
 	enableFeatures       []string
 	endpoints            []string
 
+	replicaLabels []string
 	tracingConfig string
 
 	e2e.Linkable
@@ -200,6 +241,7 @@ func NewQuerierBuilder(e e2e.Environment, name string, storeAddresses ...string)
 		name:           name,
 		storeAddresses: storeAddresses,
 		image:          DefaultImage(),
+		replicaLabels:  []string{replicaLabel},
 	}
 }
 
@@ -263,6 +305,12 @@ func (q *QuerierBuilder) WithTracingConfig(tracingConfig string) *QuerierBuilder
 	return q
 }
 
+// WithReplicaLabels replaces default [replica] replica label configuration for the querier.
+func (q *QuerierBuilder) WithReplicaLabels(labels ...string) *QuerierBuilder {
+	q.replicaLabels = labels
+	return q
+}
+
 func (q *QuerierBuilder) Init() e2e.InstrumentedRunnable {
 	args, err := q.collectArgs()
 	if err != nil {
@@ -284,40 +332,36 @@ func (q *QuerierBuilder) collectArgs() ([]string, error) {
 		"--grpc-address":          ":9091",
 		"--grpc-grace-period":     "0s",
 		"--http-address":          ":8080",
-		"--query.replica-label":   replicaLabel,
 		"--store.sd-dns-interval": "5s",
 		"--log.level":             infoLogLevel,
 		"--query.max-concurrent":  "1",
 		"--store.sd-interval":     "5s",
 	})
+
+	for _, repl := range q.replicaLabels {
+		args = append(args, "--query.replica-label="+repl)
+	}
 	for _, addr := range q.storeAddresses {
 		args = append(args, "--store="+addr)
 	}
-
 	for _, addr := range q.ruleAddresses {
 		args = append(args, "--rule="+addr)
 	}
-
 	for _, addr := range q.targetAddresses {
 		args = append(args, "--target="+addr)
 	}
-
 	for _, addr := range q.metadataAddresses {
 		args = append(args, "--metadata="+addr)
 	}
-
 	for _, addr := range q.exemplarAddresses {
 		args = append(args, "--exemplar="+addr)
 	}
-
 	for _, feature := range q.enableFeatures {
 		args = append(args, "--enable-feature="+feature)
 	}
-
 	for _, addr := range q.endpoints {
 		args = append(args, "--endpoint="+addr)
 	}
-
 	if len(q.fileSDStoreAddresses) > 0 {
 		if err := os.MkdirAll(q.Dir(), 0750); err != nil {
 			return nil, errors.Wrap(err, "create query dir failed")
@@ -333,25 +377,21 @@ func (q *QuerierBuilder) collectArgs() ([]string, error) {
 			return nil, err
 		}
 
-		if err := ioutil.WriteFile(q.Dir()+"/filesd.yaml", b, 0600); err != nil {
+		if err := os.WriteFile(q.Dir()+"/filesd.yaml", b, 0600); err != nil {
 			return nil, errors.Wrap(err, "creating query SD config failed")
 		}
 
 		args = append(args, "--store.sd-files="+filepath.Join(q.InternalDir(), "filesd.yaml"))
 	}
-
 	if q.routePrefix != "" {
 		args = append(args, "--web.route-prefix="+q.routePrefix)
 	}
-
 	if q.externalPrefix != "" {
 		args = append(args, "--web.external-prefix="+q.externalPrefix)
 	}
-
 	if q.tracingConfig != "" {
 		args = append(args, "--tracing.config="+q.tracingConfig)
 	}
-
 	return args, nil
 }
 
@@ -362,12 +402,15 @@ type ReceiveBuilder struct {
 
 	f e2e.FutureInstrumentedRunnable
 
-	maxExemplars    int
-	ingestion       bool
-	hashringConfigs []receive.HashringConfig
-	relabelConfigs  []*relabel.Config
-	replication     int
-	image           string
+	maxExemplars        int
+	ingestion           bool
+	limit               int
+	metamonitoring      string
+	metamonitoringQuery string
+	hashringConfigs     []receive.HashringConfig
+	relabelConfigs      []*relabel.Config
+	replication         int
+	image               string
 }
 
 func NewReceiveBuilder(e e2e.Environment, name string) *ReceiveBuilder {
@@ -409,6 +452,15 @@ func (r *ReceiveBuilder) WithRelabelConfigs(relabelConfigs []*relabel.Config) *R
 	return r
 }
 
+func (r *ReceiveBuilder) WithValidationEnabled(limit int, metamonitoring string, query ...string) *ReceiveBuilder {
+	r.limit = limit
+	r.metamonitoring = metamonitoring
+	if len(query) > 0 {
+		r.metamonitoringQuery = query[0]
+	}
+	return r
+}
+
 // Init creates a Thanos Receive instance.
 // If ingestion is enabled it will be configured for ingesting samples.
 // If routing is configured (i.e. hashring configuration is provided) it routes samples to other receivers.
@@ -435,6 +487,14 @@ func (r *ReceiveBuilder) Init() e2e.InstrumentedRunnable {
 		args["--receive.local-endpoint"] = r.InternalEndpoint("grpc")
 	}
 
+	if r.limit != 0 && r.metamonitoring != "" {
+		args["--receive.tenant-limits.max-head-series"] = fmt.Sprintf("%v", r.limit)
+		args["--receive.tenant-limits.meta-monitoring-url"] = r.metamonitoring
+		if r.metamonitoringQuery != "" {
+			args["--receive.tenant-limits.meta-monitoring-query"] = r.metamonitoringQuery
+		}
+	}
+
 	if err := os.MkdirAll(filepath.Join(r.Dir(), "data"), 0750); err != nil {
 		return e2e.NewErrInstrumentedRunnable(r.Name(), errors.Wrap(err, "create receive dir"))
 	}
@@ -445,7 +505,7 @@ func (r *ReceiveBuilder) Init() e2e.InstrumentedRunnable {
 			return e2e.NewErrInstrumentedRunnable(r.Name(), errors.Wrapf(err, "generate hashring file: %v", hashring))
 		}
 
-		if err := ioutil.WriteFile(filepath.Join(r.Dir(), "hashrings.json"), b, 0600); err != nil {
+		if err := os.WriteFile(filepath.Join(r.Dir(), "hashrings.json"), b, 0600); err != nil {
 			return e2e.NewErrInstrumentedRunnable(r.Name(), errors.Wrap(err, "creating receive config"))
 		}
 
@@ -477,6 +537,8 @@ type RulerBuilder struct {
 	amCfg        []alert.AlertmanagerConfig
 	replicaLabel string
 	image        string
+	resendDelay  string
+	evalInterval string
 }
 
 // NewRulerBuilder is a Ruler future that allows extra configuration before initialization.
@@ -504,6 +566,16 @@ func (r *RulerBuilder) WithAlertManagerConfig(amCfg []alert.AlertmanagerConfig) 
 
 func (r *RulerBuilder) WithReplicaLabel(replicaLabel string) *RulerBuilder {
 	r.replicaLabel = replicaLabel
+	return r
+}
+
+func (r *RulerBuilder) WithResendDelay(resendDelay string) *RulerBuilder {
+	r.resendDelay = resendDelay
+	return r
+}
+
+func (r *RulerBuilder) WithEvalInterval(evalInterval string) *RulerBuilder {
+	r.evalInterval = evalInterval
 	return r
 }
 
@@ -550,6 +622,15 @@ func (r *RulerBuilder) initRule(internalRuleDir string, queryCfg []httpconfig.Co
 	if r.replicaLabel != "" {
 		ruleArgs["--label"] = fmt.Sprintf(`%s="%s"`, replicaLabel, r.replicaLabel)
 	}
+
+	if r.resendDelay != "" {
+		ruleArgs["--resend-delay"] = r.resendDelay
+	}
+
+	if r.evalInterval != "" {
+		ruleArgs["--eval-interval"] = r.evalInterval
+	}
+
 	if remoteWriteCfg != nil {
 		rwCfgBytes, err := yaml.Marshal(struct {
 			RemoteWriteConfigs []*config.RemoteWriteConfig `yaml:"remote_write,omitempty"`
@@ -584,7 +665,7 @@ route:
 receivers:
 - name: 'null'
 `
-	if err := ioutil.WriteFile(filepath.Join(f.Dir(), "config.yaml"), []byte(config), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(f.Dir(), "config.yaml"), []byte(config), 0600); err != nil {
 		return e2e.NewErrInstrumentedRunnable(name, errors.Wrap(err, "creating alertmanager config file failed"))
 	}
 
@@ -688,7 +769,6 @@ func (c *CompactorBuilder) Init(bucketConfig client.BucketConfig, relabelConfig 
 			"--data-dir":                 c.InternalDir(),
 			"--objstore.config":          string(bktConfigBytes),
 			"--http-address":             ":8080",
-			"--block-sync-concurrency":   "50",
 			"--compact.cleanup-interval": "15s",
 			"--selector.relabel-config":  string(relabelConfigBytes),
 			"--wait":                     "",
@@ -697,26 +777,34 @@ func (c *CompactorBuilder) Init(bucketConfig client.BucketConfig, relabelConfig 
 	}))
 }
 
-func NewQueryFrontend(e e2e.Environment, name, downstreamURL string, cacheConfig queryfrontend.CacheProviderConfig) e2e.InstrumentedRunnable {
+func NewQueryFrontend(e e2e.Environment, name, downstreamURL string, config queryfrontend.Config, cacheConfig queryfrontend.CacheProviderConfig) e2e.InstrumentedRunnable {
 	cacheConfigBytes, err := yaml.Marshal(cacheConfig)
 	if err != nil {
 		return e2e.NewErrInstrumentedRunnable(name, errors.Wrapf(err, "marshal response cache config file: %v", cacheConfig))
 	}
 
-	args := e2e.BuildArgs(map[string]string{
+	flags := map[string]string{
 		"--debug.name":                        fmt.Sprintf("query-frontend-%s", name),
 		"--http-address":                      ":8080",
 		"--query-frontend.downstream-url":     downstreamURL,
 		"--log.level":                         infoLogLevel,
 		"--query-range.response-cache-config": string(cacheConfigBytes),
-	})
+	}
+
+	if !config.QueryRangeConfig.AlignRangeWithStep {
+		flags["--no-query-range.align-range-with-step"] = ""
+	}
+
+	if config.NumShards > 0 {
+		flags["--query-frontend.vertical-shards"] = strconv.Itoa(config.NumShards)
+	}
 
 	return e2e.NewInstrumentedRunnable(
 		e, fmt.Sprintf("query-frontend-%s", name),
 	).WithPorts(map[string]int{"http": 8080}, "http").Init(
 		e2e.StartOptions{
 			Image:            DefaultImage(),
-			Command:          e2e.NewCommand("query-frontend", args...),
+			Command:          e2e.NewCommand("query-frontend", e2e.BuildArgs(flags)...),
 			Readiness:        e2e.NewHTTPReadinessProbe("http", "/-/ready", 200, 200),
 			User:             strconv.Itoa(os.Getuid()),
 			WaitReadyBackoff: &defaultBackoffConfig,
@@ -751,7 +839,7 @@ http {
 		return e2e.NewErrInstrumentedRunnable(name, errors.Wrap(err, "create store dir"))
 	}
 
-	if err := ioutil.WriteFile(filepath.Join(f.Dir(), "nginx.conf"), []byte(conf), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(f.Dir(), "nginx.conf"), []byte(conf), 0600); err != nil {
 		return e2e.NewErrInstrumentedRunnable(name, errors.Wrap(err, "creating nginx config file failed"))
 	}
 
@@ -914,7 +1002,7 @@ func genCerts(certPath, privkeyPath, caPath, serverName string) error {
 		Type:  "CERTIFICATE",
 		Bytes: caBytes,
 	})
-	err = ioutil.WriteFile(caPath, caPEM, 0644)
+	err = os.WriteFile(caPath, caPEM, 0644)
 	if err != nil {
 		return err
 	}
@@ -928,7 +1016,7 @@ func genCerts(certPath, privkeyPath, caPath, serverName string) error {
 		Type:  "CERTIFICATE",
 		Bytes: certBytes,
 	})
-	err = ioutil.WriteFile(certPath, certPEM, 0644)
+	err = os.WriteFile(certPath, certPEM, 0644)
 	if err != nil {
 		return err
 	}
@@ -937,7 +1025,7 @@ func genCerts(certPath, privkeyPath, caPath, serverName string) error {
 		Type:  "RSA PRIVATE KEY",
 		Bytes: x509.MarshalPKCS1PrivateKey(certPrivKey),
 	})
-	err = ioutil.WriteFile(privkeyPath, certPrivKeyPEM, 0644)
+	err = os.WriteFile(privkeyPath, certPrivKeyPEM, 0644)
 	if err != nil {
 		return err
 	}
@@ -946,19 +1034,20 @@ func genCerts(certPath, privkeyPath, caPath, serverName string) error {
 }
 
 func NewS3Config(bucket, endpoint, basePath string) s3.Config {
+	httpDefaultConf := s3.DefaultConfig.HTTPConfig
+	httpDefaultConf.TLSConfig = exthttp.TLSConfig{
+		CAFile:   filepath.Join(basePath, "certs", "CAs", "ca.crt"),
+		CertFile: filepath.Join(basePath, "certs", "public.crt"),
+		KeyFile:  filepath.Join(basePath, "certs", "private.key"),
+	}
+
 	return s3.Config{
-		Bucket:    bucket,
-		AccessKey: e2edb.MinioAccessKey,
-		SecretKey: e2edb.MinioSecretKey,
-		Endpoint:  endpoint,
-		Insecure:  false,
-		HTTPConfig: s3.HTTPConfig{
-			TLSConfig: objstore.TLSConfig{
-				CAFile:   filepath.Join(basePath, "certs", "CAs", "ca.crt"),
-				CertFile: filepath.Join(basePath, "certs", "public.crt"),
-				KeyFile:  filepath.Join(basePath, "certs", "private.key"),
-			},
-		},
+		Bucket:           bucket,
+		AccessKey:        e2edb.MinioAccessKey,
+		SecretKey:        e2edb.MinioSecretKey,
+		Endpoint:         endpoint,
+		Insecure:         false,
+		HTTPConfig:       httpDefaultConf,
 		BucketLookupType: s3.AutoLookup,
 	}
 }
