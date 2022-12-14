@@ -6,14 +6,13 @@ package e2e
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
 
-	"github.com/pkg/errors"
+	"github.com/efficientgo/core/errors"
 )
 
 // Containerize inspects startFn and builds Go shim with local process endpoint that imports given `startFn` function.
@@ -50,10 +49,10 @@ func Containerize(e Environment, name string, startFn func(context.Context) erro
 	}
 
 	if len(absModulePath) == 0 {
-		return nil, errors.Errorf("not a Go module %v", wd)
+		return nil, errors.Newf("not a Go module %v", wd)
 	}
 
-	f := NewInstrumentedRunnable(e, name).WithPorts(map[string]int{"http": 80}, "http").Future()
+	f := e.Runnable(name).WithPorts(map[string]int{"http": 80}).Future()
 	dir := filepath.Join(f.Dir(), "shim")
 
 	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
@@ -61,13 +60,13 @@ func Containerize(e Environment, name string, startFn func(context.Context) erro
 	}
 
 	// TODO(saswatamcode): Maybe we can do away with goModTmpl, and just run go mod init shim, go mod edit -replace %v=%v and go mod tidy here.
-	if err := ioutil.WriteFile(filepath.Join(dir, "go.mod"), []byte(fmt.Sprintf(goModTmpl, modulePath, modulePath, absModulePath)), os.ModePerm); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(fmt.Sprintf(goModTmpl, modulePath, modulePath, absModulePath)), os.ModePerm); err != nil {
 		return nil, err
 	}
-	if err := ioutil.WriteFile(filepath.Join(dir, "main.go"), []byte(fmt.Sprintf(mainFileTmpl, pkg, funcName)), os.ModePerm); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(fmt.Sprintf(mainFileTmpl, pkg, funcName)), os.ModePerm); err != nil {
 		return nil, err
 	}
-	if err := ioutil.WriteFile(filepath.Join(dir, "Dockerfile"), []byte(dockerFile), os.ModePerm); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte(dockerFile), os.ModePerm); err != nil {
 		return nil, err
 	}
 
