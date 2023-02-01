@@ -353,10 +353,11 @@ github.com/efficientgo/core/logerrcapture
 github.com/efficientgo/core/merrors
 github.com/efficientgo/core/testutil
 github.com/efficientgo/core/testutil/internal
-# github.com/efficientgo/e2e v0.13.1-0.20220923082810-8fa9daa8af8a
+# github.com/efficientgo/e2e v0.14.1-0.20230119090947-fa7ceb0197c5
 ## explicit; go 1.18
 github.com/efficientgo/e2e
 github.com/efficientgo/e2e/db
+github.com/efficientgo/e2e/host
 github.com/efficientgo/e2e/interactive
 github.com/efficientgo/e2e/monitoring
 github.com/efficientgo/e2e/monitoring/matchers
