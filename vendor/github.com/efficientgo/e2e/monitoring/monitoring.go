@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/efficientgo/e2e/host"
+
 	"github.com/efficientgo/core/errcapture"
 	"github.com/efficientgo/core/errors"
 	"github.com/efficientgo/e2e"
@@ -67,8 +69,8 @@ scrape_configs:
 	}
 
 	args := map[string]string{
-		"--config.file":                     filepath.Join(f.InternalDir(), "prometheus.yml"),
-		"--storage.tsdb.path":               f.InternalDir(),
+		"--config.file":                     filepath.Join(f.Dir(), "prometheus.yml"),
+		"--storage.tsdb.path":               f.Dir(),
 		"--storage.tsdb.max-block-duration": "2h", // No compaction - mostly not needed for quick test.
 		"--log.level":                       "info",
 		"--web.listen-address":              fmt.Sprintf(":%d", ports["http"]),
@@ -195,6 +197,7 @@ type opt struct {
 	scrapeInterval  time.Duration
 	customRegistry  *prometheus.Registry
 	customPromImage string
+	useCadvisor     bool
 }
 
 // WithScrapeInterval changes how often metrics are scrape by Prometheus. 5s by default.
@@ -220,12 +223,21 @@ func WithPrometheusImage(image string) Option {
 	}
 }
 
+func WithCadvisorDisabled() Option {
+	return func(o *opt) {
+		o.useCadvisor = false
+	}
+}
+
 type Option func(*opt)
 
 // Start deploys monitoring service which deploys Prometheus that monitors all
 // InstrumentedRunnable instances in an environment created with AsInstrumented.
 func Start(env e2e.Environment, opts ...Option) (_ *Service, err error) {
-	opt := opt{scrapeInterval: 5 * time.Second}
+	opt := opt{
+		scrapeInterval: 5 * time.Second,
+		useCadvisor:    true,
+	}
 	for _, o := range opts {
 		o(&opt)
 	}
@@ -249,8 +261,16 @@ func Start(env e2e.Environment, opts ...Option) (_ *Service, err error) {
 		h.ServeHTTP(w, req)
 	}))
 
-	// Listen on all addresses, since we need to connect to it from docker container.
-	list, err := net.Listen("tcp", "0.0.0.0:0")
+	// Listen on all tcp4 addresses, since we need to connect to it from Docker container.
+	// For unknown reasons, when using WSL 2, if the network type is "tcp" it will
+	// end up only binding to the IPv6 in the WSL host, which later cannot be acessed
+	// via IPv4 to confirm Prometheus can scrape the local endpoint.
+	// Explicitly asking for an IPv4 listener works.
+	networkType := "tcp"
+	if host.OSPlatform() == "WSL2" {
+		networkType = "tcp4"
+	}
+	list, err := net.Listen(networkType, "0.0.0.0:0")
 	if err != nil {
 		return nil, err
 	}
@@ -271,9 +291,17 @@ func Start(env e2e.Environment, opts ...Option) (_ *Service, err error) {
 	}
 	env.AddListener(l)
 
-	c := newCadvisor(env, "cadvisor")
-	if err := e2e.StartAndWaitReady(c, p); err != nil {
-		return nil, errors.Wrap(err, "starting cadvisor and monitoring and waiting until ready")
+	if opt.useCadvisor {
+		if host.OSPlatform() == "WSL2" {
+			return nil, errors.New("cadvisor is not supported in WSL 2 environments")
+		}
+		c := newCadvisor(env, "cadvisor")
+		if err := e2e.StartAndWaitReady(c); err != nil {
+			return nil, errors.Wrap(err, "starting cadvisor and waiting until ready")
+		}
+	}
+	if err := e2e.StartAndWaitReady(p); err != nil {
+		return nil, errors.Wrap(err, "starting monitoring and waiting until ready")
 	}
 
 	select {

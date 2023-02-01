@@ -26,6 +26,8 @@ type environmentOptions struct {
 	logger  Logger
 	verbose bool
 	name    string
+
+	volumes []string
 }
 
 // WithLogger tells environment to use custom logger to default one (stdout).
@@ -53,6 +55,12 @@ func WithVerbose() EnvironmentOption {
 func WithName(name string) EnvironmentOption {
 	return func(o *environmentOptions) {
 		o.name = name
+	}
+}
+
+func WithVolumes(volumes ...string) EnvironmentOption {
+	return func(o *environmentOptions) {
+		o.volumes = volumes
 	}
 }
 
@@ -107,10 +115,12 @@ type Linkable interface {
 	// Name returns unique name for the Runnable instance.
 	Name() string
 
-	// Dir returns host working directory path for this runnable.
+	// Dir returns the working directory path that is shared with the host and this runnable. The paths are exactly
+	// the same for runnable and host to enable symbolic links (as long as those don't link to paths outside of Dir or not
+	// otherwise shared with runnable).
 	Dir() string
 
-	// InternalDir returns local, environment working directory path for this runnable.
+	// Deprecated. Use Dir instead. For compatibility Dir() is returned.
 	InternalDir() string
 
 	// InternalEndpoint returns internal runnable endpoint (host:port) for given internal port.

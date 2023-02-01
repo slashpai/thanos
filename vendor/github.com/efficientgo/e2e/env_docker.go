@@ -18,13 +18,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/efficientgo/e2e/host"
+
 	"github.com/efficientgo/core/backoff"
 	"github.com/efficientgo/core/errors"
 )
 
 const (
-	dockerLocalSharedDir   = "/shared"
-	dockerMacOSGatewayAddr = "host.docker.internal"
+	dockerGatewayAddr = "host.docker.internal"
 )
 
 var (
@@ -40,7 +41,8 @@ type DockerEnvironment struct {
 	logger      Logger
 	networkName string
 
-	hostAddr string
+	hostAddr      string
+	dockerVolumes []string
 
 	registered map[string]struct{}
 	listeners  []EnvironmentListener
@@ -105,10 +107,11 @@ func New(opts ...EnvironmentOption) (_ *DockerEnvironment, err error) {
 	}
 
 	d := &DockerEnvironment{
-		logger:      e.logger,
-		networkName: e.name,
-		verbose:     e.verbose,
-		registered:  map[string]struct{}{},
+		logger:        e.logger,
+		networkName:   e.name,
+		verbose:       e.verbose,
+		registered:    map[string]struct{}{},
+		dockerVolumes: e.volumes,
 	}
 
 	// Force a shutdown in order to cleanup from a spurious situation in case
@@ -128,10 +131,10 @@ func New(opts ...EnvironmentOption) (_ *DockerEnvironment, err error) {
 		return nil, errors.Wrapf(err, "create docker network '%s'", d.networkName)
 	}
 
-	switch runtime.GOOS {
-	case "darwin":
-		d.hostAddr = dockerMacOSGatewayAddr
-	default:
+	switch host.OSPlatform() {
+	case "darwin", "WSL2":
+		d.hostAddr = dockerGatewayAddr
+	default: // the "linux" behavior is default
 		out, err := d.exec("docker", "network", "inspect", d.networkName).CombinedOutput()
 		if err != nil {
 			e.logger.Log(string(out))
@@ -268,8 +271,12 @@ func (e *DockerEnvironment) SharedDir() string {
 func (e *DockerEnvironment) buildDockerRunArgs(name string, ports map[string]int, opts StartOptions) []string {
 	args := []string{"--rm", "--net=" + e.networkName, "--name=" + dockerNetworkContainerHost(e.networkName, name), "--hostname=" + name}
 
-	// Mount the shared/ directory into the container. We share all containers dir to each other to allow easier scenarios.
-	args = append(args, "-v", fmt.Sprintf("%s:%s:z", e.dir, dockerLocalSharedDir))
+	// Mount the docker env working directory into the container. It's shared across all containers to allow easier scenarios.
+	args = append(args, "-v", fmt.Sprintf("%s:%s:z", e.dir, e.dir))
+
+	for _, v := range e.dockerVolumes {
+		args = append(args, "-v", v)
+	}
 
 	for _, v := range opts.Volumes {
 		args = append(args, "-v", v)
@@ -356,7 +363,7 @@ func (d *dockerRunnable) Dir() string {
 }
 
 func (d *dockerRunnable) InternalDir() string {
-	return filepath.Join(dockerLocalSharedDir, "data", d.Name())
+	return d.Dir()
 }
 
 func (d *dockerRunnable) Init(opts StartOptions) Runnable {
