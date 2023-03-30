@@ -18,7 +18,12 @@ package execution
 
 import (
 	"runtime"
+	"sort"
 	"time"
+
+	"github.com/prometheus/prometheus/promql"
+
+	"github.com/thanos-community/promql-engine/execution/remote"
 
 	"github.com/efficientgo/core/errors"
 
@@ -107,10 +112,6 @@ func newOperator(expr parser.Expr, storage *engstore.SelectorPool, opts *query.O
 			return nil, err
 		}
 
-		if e.Func.Variadic != 0 {
-			return nil, errors.Wrapf(parse.ErrNotImplemented, "got variadic function: %s", e)
-		}
-
 		// TODO(saswatamcode): Range vector result might need new operator
 		// before it can be non-nested. https://github.com/thanos-community/promql-engine/issues/39
 		for i := range e.Args {
@@ -159,7 +160,7 @@ func newOperator(expr parser.Expr, storage *engstore.SelectorPool, opts *query.O
 			nextOperators[i] = next
 		}
 
-		return function.NewFunctionOperator(e, call, nextOperators, stepsBatch)
+		return function.NewFunctionOperator(e, call, nextOperators, stepsBatch, opts)
 
 	case *parser.AggregateExpr:
 		hints.Func = e.Op.String()
@@ -230,7 +231,36 @@ func newOperator(expr parser.Expr, storage *engstore.SelectorPool, opts *query.O
 		if err != nil {
 			return nil, err
 		}
-		return step_invariant.NewStepInvariantOperator(model.NewVectorPool(stepsBatch), next, e.Expr, opts)
+		return step_invariant.NewStepInvariantOperator(model.NewVectorPool(stepsBatch), next, e.Expr, opts, stepsBatch)
+
+	case logicalplan.Deduplicate:
+		// The Deduplicate operator will deduplicate samples using a last-sample-wins strategy.
+		// Sorting engines by MaxT ensures that samples produced due to
+		// staleness will be overwritten and corrected by samples coming from
+		// engines with a higher max time.
+		sort.Slice(e.Expressions, func(i, j int) bool {
+			return e.Expressions[i].Engine.MaxT() < e.Expressions[j].Engine.MaxT()
+		})
+
+		operators := make([]model.VectorOperator, len(e.Expressions))
+		for i, expr := range e.Expressions {
+			operator, err := newOperator(expr, storage, opts, hints)
+			if err != nil {
+				return nil, err
+			}
+			operators[i] = operator
+		}
+		coalesce := exchange.NewCoalesce(model.NewVectorPool(stepsBatch), operators...)
+		dedup := exchange.NewDedupOperator(model.NewVectorPool(stepsBatch), coalesce)
+		return exchange.NewConcurrent(dedup, 2), nil
+
+	case logicalplan.RemoteExecution:
+		qry, err := e.Engine.NewRangeQuery(&promql.QueryOpts{}, e.Query, opts.Start, opts.End, opts.Step)
+		if err != nil {
+			return nil, err
+		}
+
+		return exchange.NewConcurrent(remote.NewExecution(qry, model.NewVectorPool(stepsBatch), opts), 2), nil
 
 	default:
 		return nil, errors.Wrapf(parse.ErrNotSupportedExpr, "got: %s", e)
@@ -273,7 +303,7 @@ func newVectorBinaryOperator(e *parser.BinaryExpr, selectorPool *engstore.Select
 	if err != nil {
 		return nil, err
 	}
-	return binary.NewVectorOperator(model.NewVectorPool(stepsBatch), leftOperator, rightOperator, e.VectorMatching, e.Op)
+	return binary.NewVectorOperator(model.NewVectorPool(stepsBatch), leftOperator, rightOperator, e.VectorMatching, e.Op, e.ReturnBool)
 }
 
 func newScalarBinaryOperator(e *parser.BinaryExpr, selectorPool *engstore.SelectorPool, opts *query.Options, hints storage.SelectHints) (model.VectorOperator, error) {
@@ -294,7 +324,7 @@ func newScalarBinaryOperator(e *parser.BinaryExpr, selectorPool *engstore.Select
 		scalarSide = binary.ScalarSideLeft
 	}
 
-	return binary.NewScalar(model.NewVectorPool(stepsBatch), lhs, rhs, e.Op, scalarSide)
+	return binary.NewScalar(model.NewVectorPool(stepsBatch), lhs, rhs, e.Op, scalarSide, e.ReturnBool)
 }
 
 // Copy from https://github.com/prometheus/prometheus/blob/v2.39.1/promql/engine.go#L791.

@@ -56,6 +56,7 @@ type pipe struct {
 	info            map[string]RedisMessage
 	timeout         time.Duration
 	pinggap         time.Duration
+	maxFlushDelay   time.Duration
 	once            sync.Once
 	r2mu            sync.Mutex
 	version         int32
@@ -87,8 +88,9 @@ func _newPipe(connFn func() (net.Conn, error), option *ClientOption, r2ps bool) 
 		ssubs: newSubs(),
 		close: make(chan struct{}),
 
-		timeout: option.ConnWriteTimeout,
-		pinggap: option.Dialer.KeepAlive,
+		timeout:       option.ConnWriteTimeout,
+		pinggap:       option.Dialer.KeepAlive,
+		maxFlushDelay: option.MaxFlushDelay,
 
 		r2ps: r2ps,
 	}
@@ -284,10 +286,16 @@ func (p *pipe) _backgroundWrite() (err error) {
 		ones  = make([]cmds.Completed, 1)
 		multi []cmds.Completed
 		ch    chan RedisResult
+
+		flushDelay = p.maxFlushDelay
+		flushStart = time.Time{}
 	)
 
 	for atomic.LoadInt32(&p.state) < 3 {
 		if ones[0], multi, ch = p.queue.NextWriteCmd(); ch == nil {
+			if flushDelay != 0 {
+				flushStart = time.Now()
+			}
 			if p.w.Buffered() == 0 {
 				err = p.Error()
 			} else {
@@ -299,6 +307,9 @@ func (p *pipe) _backgroundWrite() (err error) {
 				} else {
 					runtime.Gosched()
 					continue
+				}
+				if flushDelay != 0 && atomic.LoadInt32(&p.waits) > 1 { // do not delay for sequential usage
+					time.Sleep(flushDelay - time.Since(flushStart)) // ref: https://github.com/rueian/rueidis/issues/156
 				}
 			}
 		}
@@ -661,7 +672,7 @@ func (p *pipe) Info() map[string]RedisMessage {
 
 func (p *pipe) Do(ctx context.Context, cmd cmds.Completed) (resp RedisResult) {
 	if err := ctx.Err(); err != nil {
-		return newErrResult(ctx.Err())
+		return newErrResult(err)
 	}
 
 	if cmd.IsBlock() {
@@ -869,8 +880,8 @@ func (p *pipe) syncDo(dl time.Time, dlOk bool, cmd cmds.Completed) (resp RedisRe
 			err = context.DeadlineExceeded
 		}
 		p.error.CompareAndSwap(nil, &errs{error: err})
-		atomic.CompareAndSwapInt32(&p.state, 1, 3) // stopping the worker and let it do the cleaning
-		p.background()                             // start the background worker
+		p.conn.Close()
+		p.background() // start the background worker to clean up goroutines
 	}
 	return newResult(msg, err)
 }
@@ -910,8 +921,8 @@ abort:
 		err = context.DeadlineExceeded
 	}
 	p.error.CompareAndSwap(nil, &errs{error: err})
-	atomic.CompareAndSwapInt32(&p.state, 1, 3) // stopping the worker and let it do the cleaning
-	p.background()                             // start the background worker
+	p.conn.Close()
+	p.background() // start the background worker to clean up goroutines
 	for i := 0; i < len(resp); i++ {
 		resp[i] = newErrResult(err)
 	}
@@ -929,6 +940,15 @@ next:
 	return m, nil
 }
 
+func remainTTL(now time.Time, ttl time.Duration, pttl int64) int64 {
+	if pttl >= 0 {
+		if sttl := time.Duration(pttl) * time.Millisecond; sttl < ttl {
+			ttl = sttl
+		}
+	}
+	return now.Add(ttl).Unix()
+}
+
 func (p *pipe) DoCache(ctx context.Context, cmd cmds.Cacheable, ttl time.Duration) RedisResult {
 	if p.cache == nil {
 		return p.Do(ctx, cmds.Completed(cmd))
@@ -937,7 +957,8 @@ func (p *pipe) DoCache(ctx context.Context, cmd cmds.Cacheable, ttl time.Duratio
 		return p.doCacheMGet(ctx, cmd, ttl)
 	}
 	ck, cc := cmd.CacheKey()
-	if v, entry := p.cache.GetOrPrepare(ck, cc, ttl); v.typ != 0 {
+	now := time.Now()
+	if v, entry := p.cache.GetOrPrepare(ck, cc, now, ttl); v.typ != 0 {
 		return newResult(v, nil)
 	} else if entry != nil {
 		return newResult(entry.Wait(ctx))
@@ -958,6 +979,7 @@ func (p *pipe) DoCache(ctx context.Context, cmd cmds.Cacheable, ttl time.Duratio
 		p.cache.Cancel(ck, cc, err)
 		return newErrResult(err)
 	}
+	exec[1].setTTL(remainTTL(now, ttl, exec[0].integer))
 	return newResult(exec[1], nil)
 }
 
@@ -971,9 +993,10 @@ func (p *pipe) doCacheMGet(ctx context.Context, cmd cmds.Cacheable, ttl time.Dur
 	if mgetcc[0] == 'J' {
 		keys-- // the last one of JSON.MGET is a path, not a key
 	}
+	var now = time.Now()
 	var rewrite cmds.Arbitrary
 	for i, key := range commands[1 : keys+1] {
-		v, entry := p.cache.GetOrPrepare(key, mgetcc, ttl)
+		v, entry := p.cache.GetOrPrepare(key, mgetcc, now, ttl)
 		if v.typ != 0 { // cache hit for one key
 			if len(result.val.values) == 0 {
 				result.val.values = make([]RedisMessage, keys)
@@ -1026,10 +1049,14 @@ func (p *pipe) doCacheMGet(ctx context.Context, cmd cmds.Cacheable, ttl time.Dur
 				cmds.Put(cmd.CommandSlice())
 			}
 		}()
-		if len(rewritten.Commands()) == len(commands) { // all cache miss
-			return newResult(exec[len(exec)-1], nil)
+		last := len(exec) - 1
+		for i := range exec[last].values {
+			exec[last].values[i].setTTL(remainTTL(now, ttl, exec[i].integer))
 		}
-		partial = exec[len(exec)-1].values
+		if len(rewritten.Commands()) == len(commands) { // all cache miss
+			return newResult(exec[last], nil)
+		}
+		partial = exec[last].values
 	} else { // all cache hit
 		result.val.attrs = cacheMark
 	}
@@ -1068,12 +1095,13 @@ func (p *pipe) DoMultiCache(ctx context.Context, multi ...CacheableTTL) []RedisR
 	results := make([]RedisResult, len(multi))
 	entries := make(map[int]*entry)
 	missing := []cmds.Completed{cmds.OptInCmd, cmds.MultiCmd}
+	now := time.Now()
 	for i, ct := range multi {
 		if ct.Cmd.IsMGet() {
 			panic(panicmgetcsc)
 		}
 		ck, cc := ct.Cmd.CacheKey()
-		v, entry := p.cache.GetOrPrepare(ck, cc, ct.TTL)
+		v, entry := p.cache.GetOrPrepare(ck, cc, now, ct.TTL)
 		if v.typ != 0 { // cache hit for one key
 			results[i] = newResult(v, nil)
 			continue
@@ -1115,6 +1143,7 @@ func (p *pipe) DoMultiCache(ctx context.Context, multi ...CacheableTTL) []RedisR
 	for i := 1; i < len(exec); i += 2 {
 		for ; j < len(results); j++ {
 			if results[j].val.typ == 0 && results[j].err == nil {
+				exec[i].setTTL(remainTTL(now, multi[j].TTL, exec[i-1].integer))
 				results[j] = newResult(exec[i], nil)
 				break
 			}

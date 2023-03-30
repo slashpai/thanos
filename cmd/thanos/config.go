@@ -201,7 +201,7 @@ func (qc *queryConfig) registerFlag(cmd extkingpin.FlagClause) *queryConfig {
 	// The miekgdns resolver doesn't suffer the same issue hence defaulting to it instead.
 	// See https://bugzilla.redhat.com/show_bug.cgi?id=1953518
 	cmd.Flag("query.sd-dns-resolver", "Resolver to use. Possible options: [golang, miekgdns]").
-		Default("golang").Hidden().StringVar(&qc.dnsSDResolver)
+		Default("miekgdns").Hidden().StringVar(&qc.dnsSDResolver)
 	cmd.Flag("query.default-step", "Default range query step to use. This is only used in stateless Ruler and alert state restoration.").
 		Default("1s").DurationVar(&qc.step)
 	return qc
