@@ -40,6 +40,7 @@ import (
 	"github.com/prometheus/prometheus/tsdb"
 
 	"github.com/efficientgo/core/testutil"
+
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/extkingpin"
 	"github.com/thanos-io/thanos/pkg/runutil"
@@ -143,12 +144,12 @@ func (f *fakeAppender) AppendExemplar(ref storage.SeriesRef, l labels.Labels, e 
 }
 
 // TODO(rabenhorst): Needs to be implement for native histogram support.
-func (f *fakeAppender) AppendHistogram(ref storage.SeriesRef, l labels.Labels, t int64, h *histogram.Histogram) (storage.SeriesRef, error) {
+func (f *fakeAppender) AppendHistogram(ref storage.SeriesRef, l labels.Labels, t int64, h *histogram.Histogram, fh *histogram.FloatHistogram) (storage.SeriesRef, error) {
 	panic("not implemented")
 }
 
-func (f *fakeAppender) GetRef(l labels.Labels) (storage.SeriesRef, labels.Labels) {
-	return storage.SeriesRef(l.Hash()), l
+func (f *fakeAppender) GetRef(l labels.Labels, hash uint64) (storage.SeriesRef, labels.Labels) {
+	return storage.SeriesRef(hash), l
 }
 
 func (f *fakeAppender) Commit() error {
@@ -186,7 +187,7 @@ func newTestHandlerHashring(appendables []*fakeAppendable, replicationFactor uin
 			ReplicaHeader:     DefaultReplicaHeader,
 			ReplicationFactor: replicationFactor,
 			ForwardTimeout:    5 * time.Minute,
-			Writer:            NewWriter(log.NewNopLogger(), newFakeTenantAppendable(appendables[i])),
+			Writer:            NewWriter(log.NewNopLogger(), newFakeTenantAppendable(appendables[i]), false),
 			Limiter:           limiter,
 		})
 		handlers = append(handlers, h)
@@ -211,6 +212,7 @@ func newTestHandlerHashring(appendables []*fakeAppendable, replicationFactor uin
 func testReceiveQuorum(t *testing.T, hashringAlgo HashringAlgorithm, withConsistencyDelay bool) {
 	appenderErrFn := func() error { return errors.New("failed to get appender") }
 	conflictErrFn := func() error { return storage.ErrOutOfBounds }
+	tooOldSampleErrFn := func() error { return storage.ErrTooOldSample }
 	commitErrFn := func() error { return errors.New("failed to commit") }
 	wreq := &prompb.WriteRequest{
 		Timeseries: makeSeriesWithValues(50),
@@ -389,6 +391,23 @@ func testReceiveQuorum(t *testing.T, hashringAlgo HashringAlgorithm, withConsist
 				},
 				{
 					appender: newFakeAppender(conflictErrFn, commitErrFn, nil),
+				},
+			},
+		},
+		{
+			name:              "size 3 conflict with replication and error is ErrTooOldSample",
+			status:            http.StatusConflict,
+			replicationFactor: 3,
+			wreq:              wreq,
+			appendables: []*fakeAppendable{
+				{
+					appender: newFakeAppender(tooOldSampleErrFn, nil, nil),
+				},
+				{
+					appender: newFakeAppender(tooOldSampleErrFn, nil, nil),
+				},
+				{
+					appender: newFakeAppender(tooOldSampleErrFn, nil, nil),
 				},
 			},
 		},
@@ -850,8 +869,8 @@ func (a *tsOverrideAppender) Append(ref storage.SeriesRef, l labels.Labels, _ in
 	return a.Appender.Append(ref, l, cnt, v)
 }
 
-func (a *tsOverrideAppender) GetRef(lset labels.Labels) (storage.SeriesRef, labels.Labels) {
-	return a.Appender.(storage.GetRef).GetRef(lset)
+func (a *tsOverrideAppender) GetRef(lset labels.Labels, hash uint64) (storage.SeriesRef, labels.Labels) {
+	return a.Appender.(storage.GetRef).GetRef(lset, hash)
 }
 
 // serializeSeriesWithOneSample returns marshaled and compressed remote write requests like it would
@@ -917,7 +936,7 @@ func benchmarkHandlerMultiTSDBReceiveRemoteWrite(b testutil.TB) {
 		metadata.NoneFunc,
 	)
 	defer func() { testutil.Ok(b, m.Close()) }()
-	handler.writer = NewWriter(logger, m)
+	handler.writer = NewWriter(logger, m, false)
 
 	testutil.Ok(b, m.Flush())
 	testutil.Ok(b, m.Open())
@@ -1070,6 +1089,54 @@ func Heap(dir string) (err error) {
 	}
 	defer runutil.CloseWithErrCapture(&err, f, "close")
 	return pprof.WriteHeapProfile(f)
+}
+
+func TestIsTenantValid(t *testing.T) {
+	for _, tcase := range []struct {
+		name   string
+		tenant string
+
+		expectedErr error
+	}{
+		{
+			name:        "test malicious tenant",
+			tenant:      "/etc/foo",
+			expectedErr: errors.New("Tenant name not valid"),
+		},
+		{
+			name:        "test malicious tenant going out of receiver directory",
+			tenant:      "./../../hacker_dir",
+			expectedErr: errors.New("Tenant name not valid"),
+		},
+		{
+			name:        "test slash-only tenant",
+			tenant:      "///",
+			expectedErr: errors.New("Tenant name not valid"),
+		},
+		{
+			name:   "test default tenant",
+			tenant: "default-tenant",
+		},
+		{
+			name:   "test tenant with uuid",
+			tenant: "528d0490-8720-4478-aa29-819d90fc9a9f",
+		},
+		{
+			name:   "test valid tenant",
+			tenant: "foo",
+		},
+	} {
+		t.Run(tcase.name, func(t *testing.T) {
+			h := NewHandler(nil, &Options{})
+			err := h.isTenantValid(tcase.tenant)
+			if tcase.expectedErr != nil {
+				testutil.NotOk(t, err)
+				testutil.Equals(t, tcase.expectedErr.Error(), err.Error())
+				return
+			}
+			testutil.Ok(t, err)
+		})
+	}
 }
 
 func TestRelabel(t *testing.T) {

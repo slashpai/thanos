@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/efficientgo/core/errors"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
 	"golang.org/x/exp/slices"
@@ -27,14 +28,20 @@ type vectorOperator struct {
 	operation      operation
 	opType         parser.ItemType
 
+	lhSampleIDs []labels.Labels
+	rhSampleIDs []labels.Labels
+
 	// series contains the output series of the operator
 	series []labels.Labels
 	// The outputCache is an internal cache used to calculate
 	// the binary operation of the lhs and rhs operator.
-	outputCache []sample
+	outputCache []outputSample
 	// table is used to calculate the binary operation of two step vectors between
 	// the lhs and rhs operator.
 	table *table
+
+	// If true then 1/0 needs to be returned instead of the value.
+	returnBool bool
 }
 
 func NewVectorOperator(
@@ -43,6 +50,7 @@ func NewVectorOperator(
 	rhs model.VectorOperator,
 	matching *parser.VectorMatching,
 	operation parser.ItemType,
+	returnBool bool,
 ) (model.VectorOperator, error) {
 	op, err := newOperation(operation, true)
 	if err != nil {
@@ -63,6 +71,7 @@ func NewVectorOperator(
 		groupingLabels: groupings,
 		operation:      op,
 		opType:         operation,
+		returnBool:     returnBool,
 	}, nil
 }
 
@@ -84,15 +93,28 @@ func (o *vectorOperator) Series(ctx context.Context) ([]labels.Labels, error) {
 }
 
 func (o *vectorOperator) initOutputs(ctx context.Context) error {
-	// TODO(fpetkovski): Execute in parallel.
-	highCardSide, err := o.lhs.Series(ctx)
-	if err != nil {
-		return err
-	}
+	var highCardSide []labels.Labels
+	var errChan = make(chan error, 1)
+	go func() {
+		var err error
+		highCardSide, err = o.lhs.Series(ctx)
+		if err != nil {
+			errChan <- err
+		}
+		close(errChan)
+	}()
+
 	lowCardSide, err := o.rhs.Series(ctx)
 	if err != nil {
 		return err
 	}
+	if err := <-errChan; err != nil {
+		return err
+	}
+
+	o.lhSampleIDs = highCardSide
+	o.rhSampleIDs = lowCardSide
+
 	if o.matching.Card == parser.CardOneToMany {
 		highCardSide, lowCardSide = lowCardSide, highCardSide
 	}
@@ -114,9 +136,9 @@ func (o *vectorOperator) initOutputs(ctx context.Context) error {
 	}
 	o.series = series
 
-	o.outputCache = make([]sample, len(series))
+	o.outputCache = make([]outputSample, len(series))
 	for i := range o.outputCache {
-		o.outputCache[i].t = -1
+		o.outputCache[i].lhT = -1
 	}
 	o.pool.SetStepSize(len(highCardSide))
 
@@ -163,9 +185,26 @@ func (o *vectorOperator) Next(ctx context.Context) ([]model.StepVector, error) {
 	batch := o.pool.GetVectorBatch()
 	for i, vector := range lhs {
 		if i < len(rhs) {
-			step := o.table.execBinaryOperation(lhs[i], rhs[i])
-			batch = append(batch, step)
-			o.rhs.GetPool().PutStepVector(rhs[i])
+			step, err := o.table.execBinaryOperation(lhs[i], rhs[i], o.returnBool)
+			if err == nil {
+				batch = append(batch, step)
+				o.rhs.GetPool().PutStepVector(rhs[i])
+				continue
+			}
+
+			var sampleID, duplicateSampleID labels.Labels
+			switch err.side {
+			case lhBinOpSide:
+				sampleID = o.lhSampleIDs[err.sampleID]
+				duplicateSampleID = o.lhSampleIDs[err.duplicateSampleID]
+			case rhBinOpSide:
+				sampleID = o.rhSampleIDs[err.sampleID]
+				duplicateSampleID = o.rhSampleIDs[err.duplicateSampleID]
+			}
+			group := sampleID.MatchLabels(o.matching.On, o.matching.MatchingLabels...)
+			msg := "found duplicate series for the match group %s on the %s hand-side of the operation: [%s, %s]" +
+				";many-to-many matching not allowed: matching labels must be unique on one side"
+			return nil, errors.Newf(msg, group, err.side, sampleID.String(), duplicateSampleID.String())
 		}
 		o.lhs.GetPool().PutStepVector(vector)
 	}
@@ -232,22 +271,30 @@ func (o *vectorOperator) join(
 			continue
 		}
 	}
+	lowCardOutputSize := 0
+	for _, lowCardOutputs := range lowCardInputIndex {
+		lowCardOutputSize += len(lowCardOutputs)
+	}
 
 	highCardOutputIndex := make([]*uint64, outputSize)
-	lowCardOutputIndex := make([][]uint64, len(lowCardInputIndex))
+	lowCardOutputIndex := make([][]uint64, lowCardOutputSize)
 	for hash, highCardSeries := range highCardHashes {
-		lowCardSeriesID := lowCardInputIndex[hash][0]
-		lowCardSeries := lowCardHashes[hash][0]
-		// Each low cardinality series can map to multiple output series.
-		lowCardOutputIndex[lowCardSeriesID] = make([]uint64, 0, len(highCardSeries))
+		for _, lowCardSeriesID := range lowCardInputIndex[hash] {
+			// Each low cardinality series can map to multiple output series.
+			lowCardOutputIndex[lowCardSeriesID] = make([]uint64, 0, len(highCardSeries))
+		}
 
+		lowCardSeries := lowCardHashes[hash][0]
 		for i, output := range highCardSeries {
 			outputSeries := buildOutputSeries(uint64(len(outputIndex)), output, lowCardSeries, includeLabels)
 			outputIndex = append(outputIndex, outputSeries)
 
 			highCardSeriesID := highCardInputIndex[hash][i]
 			highCardOutputIndex[highCardSeriesID] = &outputSeries.ID
-			lowCardOutputIndex[lowCardSeriesID] = append(lowCardOutputIndex[lowCardSeriesID], outputSeries.ID)
+
+			for _, lowCardSeriesID := range lowCardInputIndex[hash] {
+				lowCardOutputIndex[lowCardSeriesID] = append(lowCardOutputIndex[lowCardSeriesID], outputSeries.ID)
+			}
 		}
 	}
 

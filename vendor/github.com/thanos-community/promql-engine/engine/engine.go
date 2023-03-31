@@ -5,12 +5,17 @@ package engine
 
 import (
 	"context"
-	"fmt"
+
+	"github.com/prometheus/prometheus/model/labels"
+	v1 "github.com/prometheus/prometheus/web/api/v1"
+
 	"io"
 	"math"
 	"runtime"
 	"sort"
 	"time"
+
+	"github.com/thanos-community/promql-engine/api"
 
 	"github.com/efficientgo/core/errors"
 	"github.com/go-kit/log"
@@ -21,7 +26,6 @@ import (
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/util/stats"
-	v1 "github.com/prometheus/prometheus/web/api/v1"
 
 	"github.com/thanos-community/promql-engine/execution"
 	"github.com/thanos-community/promql-engine/execution/model"
@@ -39,8 +43,8 @@ const (
 type Opts struct {
 	promql.EngineOpts
 
-	// DisableOptimizers disables Query optimizations using logicalPlan.DefaultOptimizers.
-	DisableOptimizers bool
+	// LogicalOptimizers are optimizers that are run if the value is not nil. If it is nil then the default optimizers are run. Default optimizer list is available in the logicalplan package.
+	LogicalOptimizers []logicalplan.Optimizer
 
 	// DisableFallback enables mode where engine returns error if some expression of feature is not yet implemented
 	// in the new engine, instead of falling back to prometheus engine.
@@ -52,7 +56,69 @@ type Opts struct {
 	DebugWriter io.Writer
 }
 
-func New(opts Opts) v1.QueryEngine {
+func (o Opts) getLogicalOptimizers() []logicalplan.Optimizer {
+	if o.LogicalOptimizers == nil {
+		return logicalplan.DefaultOptimizers
+	}
+
+	return o.LogicalOptimizers
+}
+
+type remoteEngine struct {
+	q         storage.Queryable
+	engine    *compatibilityEngine
+	labelSets []labels.Labels
+	maxt      int64
+}
+
+func NewRemoteEngine(opts Opts, q storage.Queryable, maxt int64, labelSets []labels.Labels) *remoteEngine {
+	return &remoteEngine{
+		q:         q,
+		labelSets: labelSets,
+		maxt:      maxt,
+		engine:    New(opts),
+	}
+}
+
+func (l remoteEngine) MaxT() int64 {
+	return l.maxt
+}
+
+func (l remoteEngine) LabelSets() []labels.Labels {
+	return l.labelSets
+}
+
+func (l remoteEngine) NewRangeQuery(opts *promql.QueryOpts, qs string, start, end time.Time, interval time.Duration) (promql.Query, error) {
+	return l.engine.NewRangeQuery(l.q, opts, qs, start, end, interval)
+}
+
+type distributedEngine struct {
+	endpoints    api.RemoteEndpoints
+	remoteEngine *compatibilityEngine
+}
+
+func NewDistributedEngine(opts Opts, endpoints api.RemoteEndpoints) v1.QueryEngine {
+	opts.LogicalOptimizers = []logicalplan.Optimizer{
+		logicalplan.DistributedExecutionOptimizer{Endpoints: endpoints},
+	}
+
+	return &distributedEngine{
+		endpoints:    endpoints,
+		remoteEngine: New(opts),
+	}
+}
+
+func (l distributedEngine) SetQueryLogger(log promql.QueryLogger) {}
+
+func (l distributedEngine) NewInstantQuery(q storage.Queryable, opts *promql.QueryOpts, qs string, ts time.Time) (promql.Query, error) {
+	return l.remoteEngine.NewInstantQuery(q, opts, qs, ts)
+}
+
+func (l distributedEngine) NewRangeQuery(q storage.Queryable, opts *promql.QueryOpts, qs string, start, end time.Time, interval time.Duration) (promql.Query, error) {
+	return l.remoteEngine.NewRangeQuery(q, opts, qs, start, end, interval)
+}
+
+func New(opts Opts) *compatibilityEngine {
 	if opts.Logger == nil {
 		opts.Logger = log.NewNopLogger()
 	}
@@ -69,12 +135,12 @@ func New(opts Opts) v1.QueryEngine {
 				Help: "Number of PromQL queries.",
 			}, []string{"fallback"},
 		),
-
 		debugWriter:       opts.DebugWriter,
 		disableFallback:   opts.DisableFallback,
-		disableOptimizers: opts.DisableOptimizers,
 		logger:            opts.Logger,
 		lookbackDelta:     opts.LookbackDelta,
+		logicalOptimizers: opts.getLogicalOptimizers(),
+		timeout:           opts.Timeout,
 	}
 }
 
@@ -82,11 +148,13 @@ type compatibilityEngine struct {
 	prom    *promql.Engine
 	queries *prometheus.CounterVec
 
-	debugWriter       io.Writer
+	debugWriter io.Writer
+
 	disableFallback   bool
-	disableOptimizers bool
 	logger            log.Logger
 	lookbackDelta     time.Duration
+	logicalOptimizers []logicalplan.Optimizer
+	timeout           time.Duration
 }
 
 func (e *compatibilityEngine) SetQueryLogger(l promql.QueryLogger) {
@@ -100,9 +168,7 @@ func (e *compatibilityEngine) NewInstantQuery(q storage.Queryable, opts *promql.
 	}
 
 	lplan := logicalplan.New(expr, ts, ts)
-	if !e.disableOptimizers {
-		lplan = lplan.Optimize(logicalplan.DefaultOptimizers)
-	}
+	lplan = lplan.Optimize(e.logicalOptimizers)
 
 	exec, err := execution.New(lplan.Expr(), q, ts, ts, 0, e.lookbackDelta)
 	if e.triggerFallback(err) {
@@ -119,11 +185,12 @@ func (e *compatibilityEngine) NewInstantQuery(q storage.Queryable, opts *promql.
 	}
 
 	return &compatibilityQuery{
-		Query:  &Query{exec: exec},
-		engine: e,
-		expr:   expr,
-		ts:     ts,
-		t:      InstantQuery,
+		Query:      &Query{exec: exec, opts: opts},
+		engine:     e,
+		expr:       expr,
+		ts:         ts,
+		t:          InstantQuery,
+		resultSort: newResultSort(expr),
 	}, nil
 }
 
@@ -139,9 +206,7 @@ func (e *compatibilityEngine) NewRangeQuery(q storage.Queryable, opts *promql.Qu
 	}
 
 	lplan := logicalplan.New(expr, start, end)
-	if !e.disableOptimizers {
-		lplan = lplan.Optimize(logicalplan.DefaultOptimizers)
-	}
+	lplan = lplan.Optimize(e.logicalOptimizers)
 
 	exec, err := execution.New(lplan.Expr(), q, start, end, step, e.lookbackDelta)
 	if e.triggerFallback(err) {
@@ -158,7 +223,7 @@ func (e *compatibilityEngine) NewRangeQuery(q storage.Queryable, opts *promql.Qu
 	}
 
 	return &compatibilityQuery{
-		Query:  &Query{exec: exec},
+		Query:  &Query{exec: exec, opts: opts},
 		engine: e,
 		expr:   expr,
 		t:      RangeQuery,
@@ -167,6 +232,7 @@ func (e *compatibilityEngine) NewRangeQuery(q storage.Queryable, opts *promql.Qu
 
 type Query struct {
 	exec model.VectorOperator
+	opts *promql.QueryOpts
 }
 
 // Explain returns human-readable explanation of the created executor.
@@ -179,12 +245,83 @@ func (q *Query) Profile() {
 	// TODO(bwplotka): Return profile.
 }
 
+type sortOrder bool
+
+const (
+	sortOrderAsc  sortOrder = false
+	sortOrderDesc sortOrder = true
+)
+
+type resultSort struct {
+	sortByValues  bool
+	sortOrder     sortOrder
+	sortingLabels []string
+	groupBy       bool
+}
+
+func newResultSort(expr parser.Expr) resultSort {
+	aggr, ok := expr.(*parser.AggregateExpr)
+	if !ok {
+		return resultSort{}
+	}
+
+	switch aggr.Op {
+	case parser.TOPK:
+		return resultSort{
+			sortByValues:  true,
+			sortingLabels: aggr.Grouping,
+			sortOrder:     sortOrderDesc,
+			groupBy:       !aggr.Without,
+		}
+	case parser.BOTTOMK:
+		return resultSort{
+			sortByValues:  true,
+			sortingLabels: aggr.Grouping,
+			sortOrder:     sortOrderAsc,
+			groupBy:       !aggr.Without,
+		}
+	default:
+		return resultSort{}
+	}
+}
+
+func (s resultSort) comparer(samples *promql.Vector) func(i int, j int) bool {
+	return func(i int, j int) bool {
+		if !s.sortByValues {
+			return i < j
+		}
+
+		var iLbls labels.Labels
+		var jLbls labels.Labels
+		iLb := labels.NewBuilder((*samples)[i].Metric)
+		jLb := labels.NewBuilder((*samples)[j].Metric)
+		if s.groupBy {
+			iLbls = iLb.Keep(s.sortingLabels...).Labels(nil)
+			jLbls = jLb.Keep(s.sortingLabels...).Labels(nil)
+		} else {
+			iLbls = iLb.Del(s.sortingLabels...).Labels(nil)
+			jLbls = jLb.Del(s.sortingLabels...).Labels(nil)
+		}
+
+		lblsCmp := labels.Compare(iLbls, jLbls)
+		if lblsCmp != 0 {
+			return lblsCmp < 0
+		}
+
+		if s.sortOrder == sortOrderAsc {
+			return (*samples)[i].V < (*samples)[j].V
+		}
+		return (*samples)[i].V > (*samples)[j].V
+	}
+}
+
 type compatibilityQuery struct {
 	*Query
-	engine *compatibilityEngine
-	expr   parser.Expr
-	ts     time.Time // Empty for range queries.
-	t      QueryType
+	engine     *compatibilityEngine
+	expr       parser.Expr
+	ts         time.Time // Empty for range queries.
+	t          QueryType
+	resultSort resultSort
 
 	cancel context.CancelFunc
 }
@@ -197,7 +334,7 @@ func (q *compatibilityQuery) Exec(ctx context.Context) (ret *promql.Result) {
 	}
 	defer recoverEngine(q.engine.logger, q.expr, &ret.Err)
 
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithTimeout(ctx, q.engine.timeout)
 	defer cancel()
 	q.cancel = cancel
 
@@ -226,25 +363,8 @@ loop:
 
 			// Case where Series call might return nil, but samples are present.
 			// For example scalar(http_request_total) where http_request_total has multiple values.
-			if len(resultSeries) == 0 && len(r) != 0 {
-				numSeries := 0
-				for i := range r {
-					numSeries += len(r[i].Samples)
-				}
-
-				series = make([]promql.Series, numSeries)
-
-				for _, vector := range r {
-					for i := range vector.Samples {
-						series[i].Points = append(series[i].Points, promql.Point{
-							T: vector.T,
-							V: vector.Samples[i],
-						})
-					}
-					q.Query.exec.GetPool().PutStepVector(vector)
-				}
-				q.Query.exec.GetPool().PutVectors(r)
-				continue
+			if len(series) == 0 && len(r) != 0 {
+				series = make([]promql.Series, len(r[0].Samples))
 			}
 
 			for _, vector := range r {
@@ -255,6 +375,15 @@ loop:
 					series[s].Points = append(series[s].Points, promql.Point{
 						T: vector.T,
 						V: vector.Samples[i],
+					})
+				}
+				for i, s := range vector.HistogramIDs {
+					if len(series[s].Points) == 0 {
+						series[s].Points = make([]promql.Point, 0, 121) // Typically 1h of data.
+					}
+					series[s].Points = append(series[s].Points, promql.Point{
+						T: vector.T,
+						H: vector.Histograms[i],
 					})
 				}
 				q.Query.exec.GetPool().PutStepVector(vector)
@@ -294,10 +423,12 @@ loop:
 				Metric: series[i].Metric,
 				Point: promql.Point{
 					V: series[i].Points[0].V,
+					H: series[i].Points[0].H,
 					T: q.ts.UnixMilli(),
 				},
 			})
 		}
+		sort.Slice(vector, q.resultSort.comparer(&vector))
 		result = vector
 	case parser.ValueTypeScalar:
 		v := math.NaN()
@@ -325,7 +456,14 @@ func newErrResult(r *promql.Result, err error) *promql.Result {
 
 func (q *compatibilityQuery) Statement() parser.Statement { return nil }
 
-func (q *compatibilityQuery) Stats() *stats.Statistics { return &stats.Statistics{} }
+// Stats always returns empty query stats for now to avoid panic.
+func (q *compatibilityQuery) Stats() *stats.Statistics {
+	var enablePerStepStats bool
+	if q.opts != nil {
+		enablePerStepStats = q.opts.EnablePerStepStats
+	}
+	return &stats.Statistics{Timers: stats.NewQueryTimers(), Samples: stats.NewQuerySamples(enablePerStepStats)}
+}
 
 func (q *compatibilityQuery) Close() { q.Cancel() }
 
@@ -359,7 +497,7 @@ func recoverEngine(logger log.Logger, expr parser.Expr, errp *error) {
 		buf = buf[:runtime.Stack(buf, false)]
 
 		level.Error(logger).Log("msg", "runtime panic in engine", "expr", expr.String(), "err", e, "stacktrace", string(buf))
-		*errp = fmt.Errorf("unexpected error: %w", err)
+		*errp = errors.Wrap(err, "unexpected error")
 	}
 }
 
